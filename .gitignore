@@ -1,0 +1,7 @@
+/target
+.env
+.env.local
+*.pdb
+out/
+.DS_Store
+Thumbs.db
