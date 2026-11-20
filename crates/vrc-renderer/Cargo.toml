@@ -16,3 +16,6 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 pollster.workspace = true
+wasapi.workspace = true
+rustfft.workspace = true
+serde_json.workspace = true

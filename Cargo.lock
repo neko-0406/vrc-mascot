@@ -5306,6 +5306,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
@@ -5366,9 +5367,12 @@ dependencies = [
  "gltf",
  "image",
  "pollster",
+ "rustfft",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "vrc-schema",
+ "wasapi",
  "wgpu",
 ]
 
