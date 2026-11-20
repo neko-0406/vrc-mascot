@@ -1,0 +1,33 @@
+[package]
+name = "vrc-mascot-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+vrc-schema.workspace = true
+vrc-extractor.workspace = true
+vrc-physics.workspace = true
+vrc-renderer.workspace = true
+vrc-ai.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+tray-icon.workspace = true
+windows.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+tokio.workspace = true
+wasapi.workspace = true
+rustfft.workspace = true
+image.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+rfd.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
