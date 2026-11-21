@@ -1,12 +1,23 @@
-//! System tray icon, dynamic avatar/expression submenus, and `TrayAction` dispatch.
+//! System tray icon, dynamic avatar/expression submenus, dedicated Win32 message-pump thread
+//! (`TrayServiceHandle`), and `TrayAction` dispatch.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use tray_icon::menu::{
     CheckMenuItem, ContextMenu, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use vrc_schema::{AvatarEntry, ExpressionMenuItem, ExpressionMenuItemType};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
+    RegisterClassW, SetForegroundWindow, TranslateMessage, MSG, WM_APP, WM_CANCELMODE, WM_NULL,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+};
 
 /// Semantic action triggered from either the system tray menu or the avatar context menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,11 +124,6 @@ impl TrayMenuModel {
         Ok(Self { menu, action_map })
     }
 
-    /// Resolves a `MenuId` click event to its semantic [`TrayAction`].
-    pub fn resolve_action(&self, id: &MenuId) -> Option<&TrayAction> {
-        self.action_map.get(id)
-    }
-
     /// Returns all registered ID-to-action pairs (useful for diagnostics and tests).
     #[cfg(test)]
     pub fn actions(&self) -> &HashMap<MenuId, TrayAction> {
@@ -206,12 +212,16 @@ impl TrayController {
         Ok(())
     }
 
-    /// Resolves a `MenuId` against either the tray menu or the popup context menu.
-    pub fn resolve_action(&self, id: &MenuId) -> Option<TrayAction> {
-        self.tray_menu_model
-            .resolve_action(id)
-            .or_else(|| self.context_menu_model.resolve_action(id))
-            .cloned()
+    /// Collects all registered `MenuId -> TrayAction` entries across both menus.
+    fn collect_actions(&self) -> HashMap<MenuId, TrayAction> {
+        let mut combined = self.tray_menu_model.action_map.clone();
+        combined.extend(
+            self.context_menu_model
+                .action_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        combined
     }
 
     /// Displays the context menu anchored at the current cursor position over `hwnd_raw`.
@@ -225,6 +235,263 @@ impl TrayController {
                 .menu
                 .show_context_menu_for_hwnd(hwnd_raw, None);
         }
+    }
+}
+
+const WM_APP_PROCESS_CMD: u32 = WM_APP + 1;
+
+#[derive(Debug, Clone)]
+struct OwnedTrayMenuSpec {
+    avatars: Vec<AvatarEntry>,
+    active_avatar_id: Option<String>,
+    expressions: Vec<ExpressionMenuItem>,
+    autonomous_enabled: bool,
+    click_through_locked: bool,
+    status_window_visible: bool,
+}
+
+impl OwnedTrayMenuSpec {
+    fn from_spec(spec: &TrayMenuSpec<'_>) -> Self {
+        Self {
+            avatars: spec.avatars.to_vec(),
+            active_avatar_id: spec.active_avatar_id.map(str::to_owned),
+            expressions: spec.expressions.to_vec(),
+            autonomous_enabled: spec.autonomous_enabled,
+            click_through_locked: spec.click_through_locked,
+            status_window_visible: spec.status_window_visible,
+        }
+    }
+
+    fn as_spec(&self) -> TrayMenuSpec<'_> {
+        TrayMenuSpec {
+            avatars: &self.avatars,
+            active_avatar_id: self.active_avatar_id.as_deref(),
+            expressions: &self.expressions,
+            autonomous_enabled: self.autonomous_enabled,
+            click_through_locked: self.click_through_locked,
+            status_window_visible: self.status_window_visible,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TrayCommand {
+    Rebuild(OwnedTrayMenuSpec),
+    ShowContextMenu,
+    Shutdown,
+}
+
+/// Non-blocking handle to the dedicated `"vrc-tray-menu"` Win32 message-pump thread.
+///
+/// Running both `TrayIcon` and `muda` `TrackPopupMenu` on this dedicated thread ensures
+/// opening the avatar right-click menu or system tray menu never blocks `winit`'s 3D render loop.
+pub struct TrayServiceHandle {
+    owner_hwnd: isize,
+    cmd_tx: mpsc::Sender<TrayCommand>,
+    action_map: Arc<Mutex<HashMap<MenuId, TrayAction>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TrayServiceHandle {
+    /// Spawns the dedicated `"vrc-tray-menu"` Win32 thread and creates the tray icon & menus.
+    pub fn spawn(spec: &TrayMenuSpec<'_>) -> anyhow::Result<Self> {
+        let initial_spec = OwnedTrayMenuSpec::from_spec(spec);
+        let action_map = Arc::new(Mutex::new(HashMap::new()));
+        let action_map_thread = Arc::clone(&action_map);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TrayCommand>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<isize>>(1);
+
+        let handle = thread::Builder::new()
+            .name("vrc-tray-menu".to_owned())
+            .spawn(move || {
+                run_tray_thread(initial_spec, action_map_thread, cmd_rx, ready_tx);
+            })?;
+
+        let owner_hwnd = match ready_rx.recv() {
+            Ok(Ok(hwnd)) => hwnd,
+            Ok(Err(err)) => {
+                let _ = handle.join();
+                return Err(err);
+            }
+            Err(err) => {
+                let _ = handle.join();
+                return Err(anyhow::anyhow!("tray thread terminated during init: {err}"));
+            }
+        };
+
+        Ok(Self {
+            owner_hwnd,
+            cmd_tx,
+            action_map,
+            thread: Some(handle),
+        })
+    }
+
+    /// Queues a non-blocking menu rebuild on the tray thread.
+    pub fn rebuild(&self, spec: &TrayMenuSpec<'_>) -> anyhow::Result<()> {
+        self.cmd_tx
+            .send(TrayCommand::Rebuild(OwnedTrayMenuSpec::from_spec(spec)))
+            .map_err(|e| anyhow::anyhow!("tray command channel closed: {e}"))?;
+        self.wake_thread(false);
+        Ok(())
+    }
+
+    /// Displays the avatar right-click context menu non-blockingly on the tray thread.
+    pub fn show_context_menu(&self) {
+        if self.cmd_tx.send(TrayCommand::ShowContextMenu).is_ok() {
+            self.wake_thread(false);
+        }
+    }
+
+    /// Resolves a `MenuId` event to its semantic [`TrayAction`].
+    pub fn resolve_action(&self, id: &MenuId) -> Option<TrayAction> {
+        self.action_map
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).cloned())
+    }
+
+    /// Shuts down the tray thread cleanly so the tray icon disappears immediately on exit.
+    pub fn shutdown(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            let _ = self.cmd_tx.send(TrayCommand::Shutdown);
+            self.wake_thread(true);
+            let _ = handle.join();
+        }
+    }
+
+    fn wake_thread(&self, cancel_popup: bool) {
+        if self.owner_hwnd == 0 {
+            return;
+        }
+        let hwnd = HWND(self.owner_hwnd as *mut c_void);
+        unsafe {
+            if cancel_popup {
+                let _ = PostMessageW(Some(hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+            }
+            let _ = PostMessageW(Some(hwnd), WM_APP_PROCESS_CMD, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+impl Drop for TrayServiceHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+unsafe extern "system" fn tray_owner_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn create_tray_owner_window() -> anyhow::Result<HWND> {
+    let class_name: Vec<u16> = "VrcMascotTrayOwner\0".encode_utf16().collect();
+    let title: Vec<u16> = "VrcMascotTrayOwnerWindow\0".encode_utf16().collect();
+    unsafe {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(tray_owner_wnd_proc),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+
+        // Invisible top-level WS_POPUP (NOT HWND_MESSAGE) so SetForegroundWindow & TrackPopupMenu
+        // dismiss cleanly when clicking outside the menu.
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(hwnd)
+    }
+}
+
+fn run_tray_thread(
+    initial_spec: OwnedTrayMenuSpec,
+    action_map: Arc<Mutex<HashMap<MenuId, TrayAction>>>,
+    cmd_rx: mpsc::Receiver<TrayCommand>,
+    ready_tx: mpsc::SyncSender<anyhow::Result<isize>>,
+) {
+    let owner_hwnd = match create_tray_owner_window() {
+        Ok(h) => h,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    let mut tray = match TrayController::new(&initial_spec.as_spec()) {
+        Ok(t) => t,
+        Err(err) => {
+            unsafe {
+                let _ = DestroyWindow(owner_hwnd);
+            }
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    if let Ok(mut guard) = action_map.lock() {
+        *guard = tray.collect_actions();
+    }
+
+    let _ = ready_tx.send(Ok(owner_hwnd.0 as isize));
+
+    let mut msg = MSG::default();
+    let mut should_quit = false;
+    loop {
+        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if ret.0 <= 0 {
+            break;
+        }
+        if msg.message == WM_APP_PROCESS_CMD {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    TrayCommand::Rebuild(owned) => {
+                        if let Err(err) = tray.rebuild(&owned.as_spec()) {
+                            tracing::warn!(error = %err, "Failed to rebuild tray menu");
+                        } else if let Ok(mut guard) = action_map.lock() {
+                            *guard = tray.collect_actions();
+                        }
+                    }
+                    TrayCommand::ShowContextMenu => unsafe {
+                        let _ = SetForegroundWindow(owner_hwnd);
+                        tray.show_context_menu(owner_hwnd.0 as isize);
+                        let _ = PostMessageW(Some(owner_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+                    },
+                    TrayCommand::Shutdown => {
+                        should_quit = true;
+                    }
+                }
+            }
+            if should_quit {
+                break;
+            }
+            continue;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+    }
+
+    drop(tray);
+    unsafe {
+        let _ = DestroyWindow(owner_hwnd);
     }
 }
 
@@ -353,5 +620,25 @@ mod tests {
         assert!(actions.contains(&&TrayAction::ToggleAutonomous));
         assert!(actions.contains(&&TrayAction::ToggleClickThroughLock));
         assert!(actions.contains(&&TrayAction::Exit));
+    }
+
+    #[test]
+    fn tray_service_handle_spawns_rebuilds_and_shuts_down_cleanly() {
+        let spec = TrayMenuSpec {
+            avatars: &[],
+            active_avatar_id: None,
+            expressions: &[],
+            autonomous_enabled: true,
+            click_through_locked: false,
+            status_window_visible: false,
+        };
+        let mut handle = TrayServiceHandle::spawn(&spec).expect("spawn tray service thread");
+        let updated_spec = TrayMenuSpec {
+            autonomous_enabled: false,
+            status_window_visible: true,
+            ..spec
+        };
+        handle.rebuild(&updated_spec).expect("rebuild tray menu");
+        handle.shutdown();
     }
 }

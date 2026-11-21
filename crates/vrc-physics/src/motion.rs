@@ -261,9 +261,24 @@ impl AutonomousMotion {
         // 2. Posture offsets (Idle / Dragged / Falling / SeatedOnTaskbar / SeatedOnWindow)
         self.update_and_apply_postures(safe_dt, pose, input.mascot_state);
 
-        // 3. Smooth cursor gaze & head/neck/eye tracking
-        if cfg.autonomous_enabled && cfg.gaze_tracking_enabled {
-            self.update_and_apply_gaze(safe_dt, pose, input.cursor_ndc);
+        // 3. Smooth cursor gaze (or gentle autonomous micro-idle look-around when cursor is absent)
+        if cfg.autonomous_enabled && (cfg.gaze_tracking_enabled || cfg.idle_enabled) {
+            let effective_cursor = if cfg.gaze_tracking_enabled {
+                input.cursor_ndc.or_else(|| {
+                    cfg.idle_enabled
+                        .then(|| self.compute_idle_look_target(cfg.move_speed_scale))
+                })
+            } else {
+                cfg.idle_enabled
+                    .then(|| self.compute_idle_look_target(cfg.move_speed_scale))
+            };
+            let head_tilt = if cfg.idle_enabled && input.cursor_ndc.is_none() {
+                let t = self.sim_time * cfg.move_speed_scale.clamp(0.1, 3.0);
+                (t * 0.31).sin() * 2.5f32.to_radians()
+            } else {
+                0.0
+            };
+            self.update_and_apply_gaze(safe_dt, pose, effective_cursor, head_tilt);
         } else {
             let decay = 1.0 - (-8.0 * safe_dt).exp();
             self.smoothed_gaze = self.smoothed_gaze.lerp(Vec2::ZERO, decay);
@@ -366,9 +381,10 @@ impl AutonomousMotion {
         pose: &mut SkeletonPose,
         mascot_state: MascotState,
     ) {
-        let sit_target = match mascot_state {
-            MascotState::SeatedOnTaskbar | MascotState::SeatedOnWindow => 1.0,
-            _ => 0.0,
+        let sit_target = if mascot_state == MascotState::SeatedOnWindow {
+            1.0
+        } else {
+            0.0
         };
         let drag_target = if mascot_state == MascotState::Dragged {
             1.0
@@ -556,11 +572,19 @@ impl AutonomousMotion {
         }
     }
 
+    fn compute_idle_look_target(&self, speed_scale: f32) -> Vec2 {
+        let t = self.sim_time * speed_scale.clamp(0.1, 3.0);
+        let x = (t * 0.42).sin() * 0.24 + (t * 0.19).sin() * 0.12;
+        let y = (t * 0.29).cos() * 0.12 - 0.03;
+        Vec2::new(x, y)
+    }
+
     fn update_and_apply_gaze(
         &mut self,
         dt: f32,
         pose: &mut SkeletonPose,
         cursor_ndc: Option<Vec2>,
+        head_roll_rad: f32,
     ) {
         let target = match cursor_ndc {
             Some(ndc) if ndc.is_finite() => ndc.clamp(Vec2::splat(-1.0), Vec2::splat(1.0)),
@@ -588,12 +612,13 @@ impl AutonomousMotion {
             apply_gaze_rot(pose, idx, self.neck_rest_world_rot, rot);
         }
 
-        // Head (~25 deg yaw, ~18 deg pitch)
+        // Head (~25 deg yaw, ~18 deg pitch + subtle idle tilt)
         if let Some(idx) = self.bones.head {
             let yaw = gx * 25.0f32.to_radians();
             let pitch = -gy * 18.0f32.to_radians();
-            let rot =
-                Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(self.left_dir, pitch);
+            let rot = Quat::from_axis_angle(Vec3::Y, yaw)
+                * Quat::from_axis_angle(self.left_dir, pitch)
+                * Quat::from_axis_angle(self.forward_dir, head_roll_rad);
             apply_gaze_rot(pose, idx, self.head_rest_world_rot, rot);
         }
 
@@ -970,7 +995,7 @@ mod tests {
         let mut motion = AutonomousMotion::new(&map, &pose);
         let cfg = MotionConfig::default();
         let sit_input = MotionInput {
-            mascot_state: MascotState::SeatedOnTaskbar,
+            mascot_state: MascotState::SeatedOnWindow,
             ..Default::default()
         };
 
@@ -1258,9 +1283,9 @@ mod tests {
         }
         assert!(saw_blink_aliases, "expected blink within 7s on rotated rig");
 
-        // Seated step: hips drop in world -Y, thigh points forward (+Z), shin drops in -Y.
+        // Seated on window step: hips drop in world -Y, thigh points forward (+Z), shin drops in -Y.
         let sit_input = MotionInput {
-            mascot_state: MascotState::SeatedOnTaskbar,
+            mascot_state: MascotState::SeatedOnWindow,
             ..Default::default()
         };
         for _ in 0..90 {
@@ -1278,6 +1303,53 @@ mod tests {
         assert!(
             knee_pos.z > thigh_pos.z + 0.15,
             "expected thigh to extend forward (+Z): thigh={thigh_pos:?}, knee={knee_pos:?}"
+        );
+    }
+
+    #[test]
+    fn seated_on_taskbar_stays_upright_without_half_squat_and_looks_around() {
+        let (map, mut pose) = make_humanoid_pose();
+        let mut motion = AutonomousMotion::new(&map, &pose);
+        let cfg = MotionConfig::default();
+        let taskbar_input = MotionInput {
+            mascot_state: MascotState::SeatedOnTaskbar,
+            cursor_ndc: None,
+            ..Default::default()
+        };
+
+        let mut max_gaze_x = 0.0f32;
+        for _ in 0..180 {
+            pose.reset_to_rest();
+            motion.step(1.0 / 60.0, &mut pose, &taskbar_input, &cfg);
+            max_gaze_x = max_gaze_x.max(motion.smoothed_gaze().x.abs());
+        }
+
+        assert_eq!(motion.sit_blend(), 0.0);
+        pose.update_world_transforms();
+        let hips_y = pose
+            .world_position(pose.find_node("Hips").unwrap())
+            .unwrap()
+            .y;
+        assert!(
+            hips_y > 0.98,
+            "expected upright standing hips (~1.0), got {hips_y}"
+        );
+
+        let l_upper = pose.local_transforms()[pose.find_node("LeftUpperLeg").unwrap()].1;
+        let l_lower = pose.local_transforms()[pose.find_node("LeftLowerLeg").unwrap()].1;
+        let (_, upper_pitch, _) = l_upper.to_euler(EulerRot::YXZ);
+        let (_, lower_pitch, _) = l_lower.to_euler(EulerRot::YXZ);
+        assert!(
+            upper_pitch.abs() < 0.05,
+            "expected straight thigh, got {upper_pitch}"
+        );
+        assert!(
+            lower_pitch.abs() < 0.05,
+            "expected straight shin, got {lower_pitch}"
+        );
+        assert!(
+            max_gaze_x > 0.05,
+            "expected micro-idle look-around when cursor is absent"
         );
     }
 }

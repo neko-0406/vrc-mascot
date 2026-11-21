@@ -4,7 +4,9 @@ pub mod perch;
 pub mod tray;
 pub mod win32;
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use glam::{Mat4, Vec2, Vec3};
@@ -18,7 +20,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{
     ElementState, Modifiers, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use crate::app_state::{current_time_of_day_label, AppState, PendingPerchAction};
@@ -26,12 +28,13 @@ use crate::status_ui::StatusUiState;
 use perch::{
     PerchController, PerchStepInput, BASE_LOGICAL_HEIGHT, BASE_LOGICAL_WIDTH, MAX_SCALE, MIN_SCALE,
 };
-use tray::{TrayAction, TrayController, TrayMenuSpec};
+use tray::{TrayAction, TrayMenuSpec, TrayServiceHandle};
 
 #[derive(Debug)]
 enum UserEvent {
     TrayIcon(TrayIconEvent),
     Menu(MenuEvent),
+    AvatarTick,
 }
 
 struct GpuContext {
@@ -51,6 +54,7 @@ struct AvatarWindowBundle {
 
 struct StatusWindowBundle {
     window: Arc<Window>,
+    hwnd: isize,
     surface: wgpu::Surface<'static>,
     surface_cfg: wgpu::SurfaceConfiguration,
     egui_ctx: egui::Context,
@@ -70,9 +74,11 @@ pub fn run_event_loop(app_state: AppState) -> anyhow::Result<()> {
     MenuEvent::set_event_handler(Some(move |ev| {
         let _ = proxy_menu.send_event(UserEvent::Menu(ev));
     }));
+    let proxy_tick = event_loop.create_proxy();
 
-    let mut runner = MascotAppRunner::new(app_state);
+    let mut runner = MascotAppRunner::new(app_state, proxy_tick);
     event_loop.run_app(&mut runner)?;
+    runner.shutdown_background_threads();
     Ok(())
 }
 
@@ -81,7 +87,7 @@ struct MascotAppRunner {
     gpu: Option<GpuContext>,
     avatar: Option<AvatarWindowBundle>,
     status: Option<StatusWindowBundle>,
-    tray: Option<TrayController>,
+    tray: Option<TrayServiceHandle>,
     perch: PerchController,
     modifiers: Modifiers,
     grabbing_physbone: bool,
@@ -100,13 +106,32 @@ struct MascotAppRunner {
     audiolink_was_active: bool,
     fps_accum_frames: u32,
     fps_accum_time: f32,
+    status_repaint_requested: bool,
+    status_repaint_deadline: Option<Instant>,
+    last_status_telemetry_redraw: Instant,
+    status_visible_flag: Arc<AtomicBool>,
+    live_tick_stop: Arc<AtomicBool>,
+    live_tick_max_fps: Arc<AtomicU32>,
+    live_tick_thread: Option<JoinHandle<()>>,
+    live_tick_proxy: EventLoopProxy<UserEvent>,
+}
+
+impl Drop for MascotAppRunner {
+    fn drop(&mut self) {
+        self.shutdown_background_threads();
+    }
 }
 
 impl MascotAppRunner {
-    fn new(app_state: AppState) -> Self {
+    fn new(app_state: AppState, live_tick_proxy: EventLoopProxy<UserEvent>) -> Self {
         let work_area = win32::get_primary_work_area();
         let perch = PerchController::new(work_area, app_state.config.display.scale);
         let now = Instant::now();
+        let status_visible_flag = Arc::new(AtomicBool::new(app_state.status_window_visible));
+        let live_tick_stop = Arc::new(AtomicBool::new(false));
+        let live_tick_max_fps = Arc::new(AtomicU32::new(
+            app_state.config.display.max_fps.clamp(15, 240),
+        ));
 
         Self {
             app_state,
@@ -132,7 +157,57 @@ impl MascotAppRunner {
             audiolink_was_active: false,
             fps_accum_frames: 0,
             fps_accum_time: 0.0,
+            status_repaint_requested: true,
+            status_repaint_deadline: None,
+            last_status_telemetry_redraw: now - Duration::from_secs(1),
+            status_visible_flag,
+            live_tick_stop,
+            live_tick_max_fps,
+            live_tick_thread: None,
+            live_tick_proxy,
         }
+    }
+
+    fn ensure_live_tick_thread(&mut self) {
+        if self.live_tick_thread.is_some() {
+            return;
+        }
+        let visible_flag = Arc::clone(&self.status_visible_flag);
+        let stop_flag = Arc::clone(&self.live_tick_stop);
+        let max_fps_atomic = Arc::clone(&self.live_tick_max_fps);
+        let proxy = self.live_tick_proxy.clone();
+        if let Ok(handle) = thread::Builder::new()
+            .name("vrc-avatar-live-tick".to_owned())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Acquire) {
+                    if !visible_flag.load(Ordering::Acquire) {
+                        thread::park();
+                        continue;
+                    }
+                    let fps = max_fps_atomic.load(Ordering::Relaxed).clamp(15, 240);
+                    let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+                    thread::sleep(interval);
+                    if !stop_flag.load(Ordering::Acquire) && visible_flag.load(Ordering::Acquire) {
+                        let _ = proxy.send_event(UserEvent::AvatarTick);
+                    }
+                }
+            })
+        {
+            self.live_tick_thread = Some(handle);
+        }
+    }
+
+    fn shutdown_background_threads(&mut self) {
+        self.live_tick_stop.store(true, Ordering::Release);
+        self.status_visible_flag.store(false, Ordering::Release);
+        if let Some(handle) = self.live_tick_thread.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+        if let Some(tray) = &mut self.tray {
+            tray.shutdown();
+        }
+        self.tray = None;
     }
 
     fn init_windows_and_gpu(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
@@ -176,6 +251,7 @@ impl MascotAppRunner {
             status_attrs = status_attrs.with_window_icon(Some(icon));
         }
         let status_window = Arc::new(event_loop.create_window(status_attrs)?);
+        let status_hwnd = win32::hwnd_from_winit(&status_window).unwrap_or(0);
 
         // Shared single wgpu Instance / Adapter / Device / Queue across both windows.
         // Prefer DX12 DirectComposition (`DxgiFromVisual`) on Windows for native transparent
@@ -253,13 +329,22 @@ impl MascotAppRunner {
             .copied()
             .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
             .unwrap_or(status_caps.alpha_modes[0]);
+        let status_present_mode = [
+            wgpu::PresentMode::AutoNoVsync,
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
+            wgpu::PresentMode::AutoVsync,
+        ]
+        .into_iter()
+        .find(|m| status_caps.present_modes.contains(m))
+        .unwrap_or(wgpu::PresentMode::AutoVsync);
         let st_phys = status_window.inner_size();
         let status_surface_cfg = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: status_format,
             width: st_phys.width.max(1),
             height: st_phys.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: status_present_mode,
             alpha_mode: status_alpha,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -283,7 +368,7 @@ impl MascotAppRunner {
             egui_wgpu::RendererOptions::default(),
         );
 
-        let tray = TrayController::new(&self.build_tray_spec())?;
+        let tray = TrayServiceHandle::spawn(&self.build_tray_spec())?;
 
         if self.app_state.status_window_visible {
             status_window.set_visible(true);
@@ -320,6 +405,7 @@ impl MascotAppRunner {
         });
         self.status = Some(StatusWindowBundle {
             window: status_window,
+            hwnd: status_hwnd,
             surface: status_surface,
             surface_cfg: status_surface_cfg,
             egui_ctx,
@@ -328,6 +414,12 @@ impl MascotAppRunner {
             ui_state: StatusUiState::default(),
         });
         self.tray = Some(tray);
+        self.ensure_live_tick_thread();
+        if self.app_state.status_window_visible {
+            if let Some(handle) = &self.live_tick_thread {
+                handle.thread().unpark();
+            }
+        }
 
         Ok(())
     }
@@ -366,6 +458,14 @@ impl MascotAppRunner {
     fn set_status_window_visible(&mut self, visible: bool) {
         self.app_state.status_window_visible = visible;
         self.app_state.menu_dirty = true;
+        self.status_visible_flag.store(visible, Ordering::Release);
+        if visible {
+            self.status_repaint_requested = true;
+            self.ensure_live_tick_thread();
+            if let Some(handle) = &self.live_tick_thread {
+                handle.thread().unpark();
+            }
+        }
         if let Some(status) = &self.status {
             status.window.set_visible(visible);
             if visible {
@@ -413,6 +513,7 @@ impl MascotAppRunner {
                 self.app_state.menu_dirty = true;
             }
             TrayAction::Exit => {
+                self.shutdown_background_threads();
                 event_loop.exit();
             }
         }
@@ -435,6 +536,10 @@ impl MascotAppRunner {
     }
 
     fn apply_config_effects_to_windows(&mut self) {
+        self.live_tick_max_fps.store(
+            self.app_state.config.display.max_fps.clamp(15, 240),
+            Ordering::Relaxed,
+        );
         let work_area = win32::get_primary_work_area();
         if (self.app_state.config.display.scale - self.perch.scale()).abs() > 1e-3 {
             self.apply_scale_change(self.app_state.config.display.scale);
@@ -472,12 +577,14 @@ impl MascotAppRunner {
             }
         }
 
+        let status_hwnd = self.status.as_ref().map(|s| s.hwnd).unwrap_or(0);
         let Some(gpu) = &self.gpu else {
             return;
         };
         let Some(av) = &mut self.avatar else {
             return;
         };
+        let exclude_hwnds = [av.hwnd, status_hwnd];
 
         // Non-blocking hit-test staging readback
         av.renderer.poll_hit_test_readback(&gpu.device);
@@ -491,7 +598,7 @@ impl MascotAppRunner {
                     self.perch.move_to_taskbar(work_area, taskbar_rect);
                 }
                 PendingPerchAction::SitOnWindow => {
-                    self.visible_windows_cache = win32::enumerate_visible_windows(av.hwnd);
+                    self.visible_windows_cache = win32::enumerate_visible_windows(&exclude_hwnds);
                     let _ = self.perch.sit_on_top_window(
                         &self.visible_windows_cache,
                         &self.app_state.config.motion.perch_exclude_apps,
@@ -504,8 +611,8 @@ impl MascotAppRunner {
         // Poll desktop environment (~4 Hz) for fullscreen state & visible windows
         if self.last_env_poll.elapsed() >= Duration::from_millis(250) {
             self.last_env_poll = Instant::now();
-            self.visible_windows_cache = win32::enumerate_visible_windows(av.hwnd);
-            if let Some(fg) = win32::get_foreground_window_info(av.hwnd) {
+            self.visible_windows_cache = win32::enumerate_visible_windows(&exclude_hwnds);
+            if let Some(fg) = win32::get_foreground_window_info(&exclude_hwnds) {
                 self.last_fg_process = Some(fg.process_name);
                 self.last_fg_title = Some(fg.title);
                 let hide = fg.is_fullscreen && self.app_state.config.motion.hide_on_fullscreen;
@@ -797,6 +904,14 @@ impl MascotAppRunner {
             status.egui_renderer.free_texture(id);
         }
 
+        if let Some(vp) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+            if vp.repaint_delay.is_zero() {
+                self.status_repaint_requested = true;
+            } else if vp.repaint_delay < Duration::from_secs(10) {
+                self.status_repaint_deadline = Some(Instant::now() + vp.repaint_delay);
+            }
+        }
+
         // Apply UI-requested immediate effects outside the `status` borrow
         if effects.reset_position {
             let work_area = win32::get_primary_work_area();
@@ -849,6 +964,23 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
                     self.handle_tray_action(action, event_loop);
                 }
             }
+            UserEvent::AvatarTick => {
+                let now = Instant::now();
+                if now >= self.next_frame_deadline {
+                    let max_fps = self.app_state.config.display.max_fps.clamp(15, 240);
+                    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(max_fps));
+                    let elapsed_sec = (now - self.last_frame_time).as_secs_f32().clamp(0.0, 0.25);
+                    if self.perch.state() != MascotState::Dragged && !self.grabbing_physbone {
+                        self.idle_seconds += elapsed_sec;
+                    }
+                    self.next_frame_deadline = now + frame_interval;
+                    if !self.hidden_by_fullscreen {
+                        if let Some(av) = &self.avatar {
+                            av.window.request_redraw();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -865,6 +997,7 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
             if let Some(status) = &mut self.status {
                 let resp = status.egui_state.on_window_event(&status.window, &event);
                 if resp.repaint && self.app_state.status_window_visible {
+                    self.status_repaint_requested = true;
                     status.window.request_redraw();
                 }
             }
@@ -879,6 +1012,7 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
                             status.surface_cfg.width = new_size.width;
                             status.surface_cfg.height = new_size.height;
                             status.surface.configure(&gpu.device, &status.surface_cfg);
+                            self.status_repaint_requested = true;
                         }
                     }
                 }
@@ -893,6 +1027,7 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
         if Some(avatar_id) == Some(Some(window_id)) {
             match event {
                 WindowEvent::CloseRequested => {
+                    self.shutdown_background_threads();
                     event_loop.exit();
                 }
                 WindowEvent::ModifiersChanged(mods) => {
@@ -964,8 +1099,8 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
                     button: WinitMouseButton::Right,
                     ..
                 } => {
-                    if let (Some(av), Some(tray)) = (&self.avatar, &self.tray) {
-                        tray.show_context_menu(av.hwnd);
+                    if let Some(tray) = &self.tray {
+                        tray.show_context_menu();
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -1014,11 +1149,8 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
         let max_fps = self.app_state.config.display.max_fps.clamp(15, 240);
         let frame_interval = Duration::from_secs_f64(1.0 / f64::from(max_fps));
 
-        // Periodic Decisions AI timer
-        if self.app_state.config.motion.autonomous_enabled
-            && self.app_state.config.ai.decisions_enabled
-            && !self.paused_by_fullscreen
-        {
+        // Periodic autonomous behavior timer (uses remote AI when enabled/available, or local fallback)
+        if self.app_state.config.motion.autonomous_enabled && !self.paused_by_fullscreen {
             let interval =
                 Duration::from_secs(self.app_state.config.ai.decision_interval_sec.max(5));
             if now.duration_since(self.last_decision_check) >= interval {
@@ -1041,8 +1173,19 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
                     av.window.request_redraw();
                 }
             }
-            // Only redraw Status & Settings window while visible; zero CPU/GPU overhead when hidden.
-            if self.app_state.status_window_visible {
+        }
+
+        // Redraw Status & Settings window on demand (egui repaint or ~4 Hz telemetry refresh)
+        // so it never VSync-stalls the 3D avatar window.
+        if self.app_state.status_window_visible {
+            let due_for_egui = self.status_repaint_requested
+                || self.status_repaint_deadline.is_some_and(|d| now >= d);
+            let due_for_telemetry =
+                now.duration_since(self.last_status_telemetry_redraw) >= Duration::from_millis(250);
+            if due_for_egui || due_for_telemetry {
+                self.status_repaint_requested = false;
+                self.status_repaint_deadline = None;
+                self.last_status_telemetry_redraw = now;
                 if let Some(status) = &self.status {
                     status.window.request_redraw();
                 }

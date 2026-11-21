@@ -24,7 +24,12 @@ use crate::window_manager::win32;
 /// Commands dispatched from the UI / winit loop to the Tokio background worker.
 #[derive(Debug, Clone)]
 pub enum AppCommand {
-    RunDecision(DecisionContext),
+    RunDecision {
+        ctx: DecisionContext,
+        window_perch_enabled: bool,
+        is_seated_on_window: bool,
+        tick: u64,
+    },
     SendChat(String),
     ClearChatHistory,
     CheckVoicevox,
@@ -155,6 +160,8 @@ pub struct AppState {
     pub chat_in_flight: bool,
     pub decision_log: Vec<DecisionLogEntry>,
     pub decision_in_flight: bool,
+    pub decision_tick_counter: u64,
+    pub last_decisions_error: Option<String>,
     pub voicevox_online: bool,
     pub voicevox_version: Option<String>,
     pub voicevox_speakers: Vec<VoicevoxSpeaker>,
@@ -280,6 +287,8 @@ impl AppState {
             chat_in_flight: false,
             decision_log: Vec::new(),
             decision_in_flight: false,
+            decision_tick_counter: 0,
+            last_decisions_error: None,
             voicevox_online: false,
             voicevox_version: None,
             voicevox_speakers: Vec::new(),
@@ -307,8 +316,15 @@ impl AppState {
         if self.decision_in_flight {
             return;
         }
+        let tick = self.decision_tick_counter;
+        self.decision_tick_counter = self.decision_tick_counter.wrapping_add(1);
         self.decision_in_flight = true;
-        let _ = self.cmd_tx.send(AppCommand::RunDecision(ctx));
+        let _ = self.cmd_tx.send(AppCommand::RunDecision {
+            ctx,
+            window_perch_enabled: self.config.motion.window_perch_enabled,
+            is_seated_on_window: self.mascot_state == MascotState::SeatedOnWindow,
+            tick,
+        });
     }
 
     /// Sends a user chat message to the background AI worker and records it in chat history.
@@ -408,6 +424,7 @@ impl AppState {
 
         self.config = new_config.clone();
         self.draft_config = new_config.clone();
+        self.last_decisions_error = None;
 
         self.speech_player
             .set_volume(self.config.voice.volume_scale);
@@ -511,8 +528,13 @@ impl AppState {
             } => {
                 self.decision_in_flight = false;
                 if let Some(err) = error {
-                    self.status_notice = Some(format!("Decisions API エラー: {err}"));
-                    return;
+                    if self.last_decisions_error.as_deref() != Some(err.as_str()) {
+                        self.status_notice =
+                            Some(format!("Decisions API エラー (ローカル自律に切替): {err}"));
+                        self.last_decisions_error = Some(err);
+                    }
+                } else {
+                    self.last_decisions_error = None;
                 }
                 let reason = output
                     .reason
@@ -798,49 +820,80 @@ async fn run_background_worker(
                     });
                 }
             },
-            AppCommand::RunDecision(ctx) => {
+            AppCommand::RunDecision {
+                ctx,
+                window_perch_enabled,
+                is_seated_on_window,
+                tick,
+            } => {
                 let ts = now_epoch_ms();
-                match service.decide(&ctx).await {
-                    Ok(decision) => {
-                        let _ = event_tx.send(AppEvent::DecisionResult {
-                            output: decision.clone(),
-                            timestamp_epoch_ms: ts,
-                            error: None,
-                        });
-                        if decision.action == DecisionAction::Speak {
-                            let intent = decision
-                                .speech_intent
-                                .as_deref()
-                                .unwrap_or("ユーザーに優しく一言話しかける");
-                            match service.speak_from_intent(intent).await {
-                                Ok(reply) => {
-                                    let (wav_bytes, timeline, voice_error) = maybe_synthesize(
-                                        &service,
-                                        &mut voicevox_online,
-                                        &reply.reply_text,
-                                    )
-                                    .await;
-                                    let _ = event_tx.send(AppEvent::AutonomousSpeak {
-                                        text: reply.reply_text,
-                                        emotion: reply.emotion,
-                                        wav_bytes,
-                                        timeline,
-                                        timestamp_epoch_ms: now_epoch_ms(),
-                                        voice_error,
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = event_tx.send(AppEvent::ChatError(err.to_string()));
+                if !service.ai_config.decisions_enabled
+                    || service
+                        .ai_config
+                        .decisions_provider
+                        .trim()
+                        .eq_ignore_ascii_case("local")
+                {
+                    let fallback = vrc_ai::local_fallback_decision(
+                        &ctx,
+                        window_perch_enabled,
+                        is_seated_on_window,
+                        tick,
+                    );
+                    let _ = event_tx.send(AppEvent::DecisionResult {
+                        output: fallback,
+                        timestamp_epoch_ms: ts,
+                        error: None,
+                    });
+                } else {
+                    match service.decide(&ctx).await {
+                        Ok(decision) => {
+                            let _ = event_tx.send(AppEvent::DecisionResult {
+                                output: decision.clone(),
+                                timestamp_epoch_ms: ts,
+                                error: None,
+                            });
+                            if decision.action == DecisionAction::Speak {
+                                let intent = decision
+                                    .speech_intent
+                                    .as_deref()
+                                    .unwrap_or("ユーザーに優しく一言話しかける");
+                                match service.speak_from_intent(intent).await {
+                                    Ok(reply) => {
+                                        let (wav_bytes, timeline, voice_error) = maybe_synthesize(
+                                            &service,
+                                            &mut voicevox_online,
+                                            &reply.reply_text,
+                                        )
+                                        .await;
+                                        let _ = event_tx.send(AppEvent::AutonomousSpeak {
+                                            text: reply.reply_text,
+                                            emotion: reply.emotion,
+                                            wav_bytes,
+                                            timeline,
+                                            timestamp_epoch_ms: now_epoch_ms(),
+                                            voice_error,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let _ = event_tx.send(AppEvent::ChatError(err.to_string()));
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(err) => {
-                        let _ = event_tx.send(AppEvent::DecisionResult {
-                            output: DecisionOutput::default(),
-                            timestamp_epoch_ms: ts,
-                            error: Some(err.to_string()),
-                        });
+                        Err(err) => {
+                            let fallback = vrc_ai::local_fallback_decision(
+                                &ctx,
+                                window_perch_enabled,
+                                is_seated_on_window,
+                                tick,
+                            );
+                            let _ = event_tx.send(AppEvent::DecisionResult {
+                                output: fallback,
+                                timestamp_epoch_ms: ts,
+                                error: Some(err.to_string()),
+                            });
+                        }
                     }
                 }
             }
@@ -1478,5 +1531,56 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn decision_error_falls_back_to_local_autonomy_and_notifies_once() {
+        let (base_url, server_thread) =
+            spawn_mock_http_server(move |_, _| (404, "application/json", b"{}".to_vec()));
+
+        let mut cfg = AppConfig::default();
+        cfg.ai.chat_api_key = "test-key".to_owned();
+        cfg.ai.decisions_endpoint = base_url.clone();
+        cfg.ai.decisions_model = "missing-model".to_owned();
+        cfg.ai.chat_model = "missing-model".to_owned();
+
+        let (model, manifest) = AvatarModel::procedural_fallback();
+        let mut state = AppState::build_with_parts(
+            cfg,
+            AvatarRegistry::new(std::env::temp_dir()),
+            model,
+            manifest,
+            None,
+            None,
+            SpeechPlayer::new_headless(),
+            AudioLinkCapture::new(false),
+            false,
+            Some(base_url.clone()),
+        )
+        .expect("build AppState");
+
+        state.trigger_decision(DecisionContext::default());
+        wait_until(&mut state, |s| {
+            !s.decision_in_flight && s.decision_log.len() == 1
+        });
+        assert!(state.decision_log[0].reason.contains("[ローカル自律]"));
+        assert!(state
+            .status_notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ローカル自律に切替"));
+
+        // Clear notice and trigger same failing decision again -> must NOT spam status_notice
+        state.status_notice = None;
+        state.trigger_decision(DecisionContext::default());
+        wait_until(&mut state, |s| {
+            !s.decision_in_flight && s.decision_log.len() == 2
+        });
+        assert!(state.status_notice.is_none());
+
+        drop(state);
+        let _ = std::net::TcpStream::connect(base_url.trim_start_matches("http://"))
+            .and_then(|mut s| s.write_all(b"GET /__shutdown HTTP/1.1\r\n\r\n"));
+        let _ = server_thread.join();
     }
 }

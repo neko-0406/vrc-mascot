@@ -1,10 +1,15 @@
-//! Gemini Decisions API client for low-latency structured autonomous action selection.
+//! Autonomous Decisions API client supporting Gemini, OpenAI-compatible (OpenAI/Ollama/LM Studio),
+//! and local fallback evaluation.
 
 use serde_json::{json, Value};
 use vrc_schema::{AiConfig, DecisionContext, DecisionOutput};
 
 use crate::error::AiError;
+use crate::fallback::local_fallback_decision;
 use crate::gemini::{build_generate_content_url, post_generate_content, strip_markdown_code_fence};
+use crate::openai::{
+    build_chat_completions_url, build_openai_decision_payload, post_chat_completions,
+};
 
 const DECISION_SYSTEM_INSTRUCTION: &str = "\
 You are the autonomous behavior decision engine for a Windows 3D desktop mascot. \
@@ -39,7 +44,7 @@ impl DecisionsClient {
         Self { client }
     }
 
-    /// Evaluates `ctx` against the configured Gemini Decisions endpoint and returns a structured
+    /// Evaluates `ctx` against the configured Decisions provider/endpoint and returns a structured
     /// [`DecisionOutput`].
     ///
     /// If `ai_cfg.decisions_enabled` is `false`, returns `DecisionOutput::default()` (`IDLE`)
@@ -53,18 +58,84 @@ impl DecisionsClient {
             return Ok(DecisionOutput::default());
         }
 
+        let provider = ai_cfg.decisions_provider.trim().to_ascii_lowercase();
+        match provider.as_str() {
+            "local" => Ok(local_fallback_decision(ctx, true, false, 0)),
+            "openai_compatible" | "openai" => {
+                let url =
+                    build_chat_completions_url(&ai_cfg.decisions_endpoint, "openai_decisions")?;
+                let api_key = resolve_decisions_api_key(ai_cfg).unwrap_or("");
+                let payload = build_openai_decision_payload(
+                    ctx,
+                    &ai_cfg.decisions_model,
+                    "openai_decisions",
+                )?;
+                let raw_text = post_chat_completions(
+                    &self.client,
+                    &url,
+                    api_key,
+                    &payload,
+                    "openai_decisions",
+                )
+                .await?;
+                parse_decision_output(&raw_text)
+            }
+            "gemini" | "" => self.decide_gemini(ctx, ai_cfg).await,
+            other => Err(AiError::InvalidResponse {
+                source_name: "decisions".to_owned(),
+                reason: format!("unsupported decisions_provider '{other}'"),
+            }),
+        }
+    }
+
+    async fn decide_gemini(
+        &self,
+        ctx: &DecisionContext,
+        ai_cfg: &AiConfig,
+    ) -> Result<DecisionOutput, AiError> {
         let api_key = resolve_decisions_api_key(ai_cfg)?;
+        let payload = build_decision_request_payload(ctx)?;
         let url = build_generate_content_url(
             &ai_cfg.decisions_endpoint,
             &ai_cfg.decisions_model,
             "gemini_decisions",
         )?;
-        let payload = build_decision_request_payload(ctx)?;
 
-        let raw_text =
-            post_generate_content(&self.client, &url, api_key, &payload, "gemini_decisions")
-                .await?;
-        parse_decision_output(&raw_text)
+        match post_generate_content(&self.client, &url, api_key, &payload, "gemini_decisions").await
+        {
+            Ok(raw_text) => parse_decision_output(&raw_text),
+            Err(AiError::ApiStatus { status: 404, body }) => {
+                let chat_provider = ai_cfg.chat_provider.trim().to_ascii_lowercase();
+                let fallback_model = ai_cfg.chat_model.trim();
+                let primary_model = ai_cfg.decisions_model.trim();
+                if (chat_provider.is_empty() || chat_provider == "gemini")
+                    && !fallback_model.is_empty()
+                    && fallback_model != primary_model
+                {
+                    tracing::warn!(
+                        decisions_model = %primary_model,
+                        fallback_model = %fallback_model,
+                        "Gemini Decisions model returned HTTP 404; retrying once with chat_model"
+                    );
+                    let retry_url = build_generate_content_url(
+                        &ai_cfg.decisions_endpoint,
+                        fallback_model,
+                        "gemini_decisions",
+                    )?;
+                    let raw_text = post_generate_content(
+                        &self.client,
+                        &retry_url,
+                        api_key,
+                        &payload,
+                        "gemini_decisions",
+                    )
+                    .await?;
+                    return parse_decision_output(&raw_text);
+                }
+                Err(AiError::ApiStatus { status: 404, body })
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -242,5 +313,98 @@ mod tests {
             .await
             .expect("disabled returns idle");
         assert_eq!(out.action, DecisionAction::Idle);
+    }
+
+    #[tokio::test]
+    async fn decisions_client_retries_with_chat_model_on_gemini_404() {
+        let server = MockHttpServer::start(move |req| {
+            if req.target.contains("gemini-decision-1") {
+                MockResponse::json(404, r#"{"error":{"message":"not found"}}"#)
+            } else if req.target.contains("gemini-2.5-flash") {
+                let envelope = json!({
+                    "candidates": [{
+                        "content": {
+                            "parts": [{ "text": r#"{"action":"CHANGE_EXPRESSION","target_expression":"happy","reason":"retry ok"}"# }]
+                        }
+                    }]
+                })
+                .to_string();
+                MockResponse::json(200, envelope)
+            } else {
+                MockResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let cfg = AiConfig {
+            chat_provider: "gemini".to_owned(),
+            chat_model: "gemini-2.5-flash".to_owned(),
+            chat_api_key: "test-key".to_owned(),
+            decisions_provider: "gemini".to_owned(),
+            decisions_endpoint: server.base_url(),
+            decisions_model: "gemini-decision-1".to_owned(),
+            ..Default::default()
+        };
+
+        let client = DecisionsClient::new().expect("build client");
+        let out = client
+            .decide(&DecisionContext::default(), &cfg)
+            .await
+            .expect("retry succeeds");
+        assert_eq!(out.action, DecisionAction::ChangeExpression);
+        assert_eq!(out.target_expression.as_deref(), Some("happy"));
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn decisions_client_supports_openai_compatible_without_api_key_and_local() {
+        let server = MockHttpServer::start(move |req| {
+            if req.target == "/v1/chat/completions" {
+                let envelope = json!({
+                    "choices": [{
+                        "message": {
+                            "content": "```json\n{\"action\":\"SIT_ON_WINDOW\",\"target_expression\":\"smile\",\"reason\":\"local llm\"}\n```"
+                        }
+                    }]
+                })
+                .to_string();
+                MockResponse::json(200, envelope)
+            } else {
+                MockResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let cfg = AiConfig {
+            decisions_provider: "openai_compatible".to_owned(),
+            decisions_endpoint: server.base_url(),
+            decisions_model: "llama3.2".to_owned(),
+            decisions_api_key: String::new(),
+            chat_api_key: String::new(),
+            ..Default::default()
+        };
+
+        let client = DecisionsClient::new().expect("build client");
+        let out = client
+            .decide(&DecisionContext::default(), &cfg)
+            .await
+            .expect("openai_compatible local llm succeeds without api key");
+        assert_eq!(out.action, DecisionAction::SitOnWindow);
+        let reqs = server.requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(!reqs[0].headers.contains_key("authorization"));
+
+        let local_cfg = AiConfig {
+            decisions_provider: "local".to_owned(),
+            ..Default::default()
+        };
+        let local_out = client
+            .decide(&DecisionContext::default(), &local_cfg)
+            .await
+            .expect("local mode succeeds");
+        assert!(local_out
+            .reason
+            .unwrap_or_default()
+            .contains("[ローカル自律]"));
     }
 }

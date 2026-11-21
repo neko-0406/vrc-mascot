@@ -1,4 +1,5 @@
-//! Gemini dialogue LLM client with bounded history and structured/fallback emotion parsing.
+//! Multi-provider dialogue LLM client (Gemini & OpenAI-compatible) with bounded history
+//! and structured/fallback emotion parsing.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,9 @@ use crate::error::AiError;
 use crate::gemini::{
     build_generate_content_url, post_generate_content, strip_markdown_code_fence,
     DEFAULT_GEMINI_ENDPOINT,
+};
+use crate::openai::{
+    build_chat_completions_url, build_openai_dialogue_payload, post_chat_completions,
 };
 
 const DIALOGUE_FORMAT_DIRECTIVE: &str = "\
@@ -34,11 +38,12 @@ struct RawDialogueJson {
     emotion: Option<String>,
 }
 
-/// Stateful Gemini chat client maintaining bounded conversation turns.
+/// Stateful dialogue chat client maintaining bounded conversation turns.
 #[derive(Debug, Clone)]
 pub struct DialogueClient {
     client: reqwest::Client,
     endpoint: String,
+    endpoint_override: Option<String>,
     history: Vec<ChatMessage>,
 }
 
@@ -60,19 +65,24 @@ impl DialogueClient {
         Self {
             client,
             endpoint: DEFAULT_GEMINI_ENDPOINT.to_owned(),
+            endpoint_override: None,
             history: Vec::new(),
         }
     }
 
-    /// Overrides the Gemini API base URL (for example, to point at a local mock server in tests).
+    /// Overrides the dialogue API base URL (for example, to point at a local mock server in tests).
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
+        let ep = endpoint.into();
+        self.endpoint = ep.clone();
+        self.endpoint_override = Some(ep);
         self
     }
 
-    /// Sets the Gemini API base URL in place.
+    /// Sets the dialogue API base URL override in place.
     pub fn set_endpoint(&mut self, endpoint: impl Into<String>) {
-        self.endpoint = endpoint.into();
+        let ep = endpoint.into();
+        self.endpoint = ep.clone();
+        self.endpoint_override = Some(ep);
     }
 
     /// Returns the currently configured base URL.
@@ -154,22 +164,65 @@ impl DialogueClient {
         current_user_prompt: &str,
         ai_cfg: &AiConfig,
     ) -> Result<DialogueResponse, AiError> {
-        let api_key = ai_cfg.chat_api_key.trim();
-        if api_key.is_empty() {
-            return Err(AiError::MissingApiKey {
-                provider: ai_cfg.chat_provider.clone(),
-            });
-        }
-
         self.prune_history(ai_cfg.max_history_turns);
 
-        let url =
-            build_generate_content_url(&self.endpoint, &ai_cfg.chat_model, "gemini_dialogue")?;
-        let payload = self.build_request_payload(current_user_prompt, ai_cfg);
+        let provider = ai_cfg.chat_provider.trim().to_ascii_lowercase();
+        let configured_endpoint = ai_cfg.chat_endpoint.trim();
+        let effective_endpoint = self
+            .endpoint_override
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| (!configured_endpoint.is_empty()).then_some(configured_endpoint))
+            .unwrap_or(self.endpoint.as_str());
 
-        let raw_text =
-            post_generate_content(&self.client, &url, api_key, &payload, "gemini_dialogue").await?;
-        parse_dialogue_response(&raw_text)
+        match provider.as_str() {
+            "openai_compatible" | "openai" => {
+                let url = build_chat_completions_url(effective_endpoint, "openai_dialogue")?;
+                let payload = build_openai_dialogue_payload(
+                    &self.history,
+                    current_user_prompt,
+                    ai_cfg,
+                    "openai_dialogue",
+                )?;
+                let raw_text = post_chat_completions(
+                    &self.client,
+                    &url,
+                    ai_cfg.chat_api_key.trim(),
+                    &payload,
+                    "openai_dialogue",
+                )
+                .await?;
+                parse_dialogue_response(&raw_text)
+            }
+            "gemini" | "" => {
+                let api_key = ai_cfg.chat_api_key.trim();
+                if api_key.is_empty() {
+                    return Err(AiError::MissingApiKey {
+                        provider: if ai_cfg.chat_provider.trim().is_empty() {
+                            "gemini".to_owned()
+                        } else {
+                            ai_cfg.chat_provider.clone()
+                        },
+                    });
+                }
+
+                let url = build_generate_content_url(
+                    effective_endpoint,
+                    &ai_cfg.chat_model,
+                    "gemini_dialogue",
+                )?;
+                let payload = self.build_request_payload(current_user_prompt, ai_cfg);
+
+                let raw_text =
+                    post_generate_content(&self.client, &url, api_key, &payload, "gemini_dialogue")
+                        .await?;
+                parse_dialogue_response(&raw_text)
+            }
+            other => Err(AiError::InvalidResponse {
+                source_name: "dialogue".to_owned(),
+                reason: format!("unsupported chat_provider '{other}'"),
+            }),
+        }
     }
 
     fn build_request_payload(&self, current_user_prompt: &str, ai_cfg: &AiConfig) -> Value {
@@ -419,5 +472,55 @@ mod tests {
 
         client.clear_history();
         assert!(client.history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dialogue_client_supports_openai_compatible_with_optional_api_key() {
+        let server = MockHttpServer::start(move |req| {
+            if req.target == "/v1/chat/completions" {
+                let envelope = json!({
+                    "choices": [{
+                        "message": {
+                            "content": r#"{"reply_text":"ローカルLLMからこんにちは！","emotion":"happy"}"#
+                        }
+                    }]
+                })
+                .to_string();
+                MockResponse::json(200, envelope)
+            } else {
+                MockResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let mut cfg = AiConfig {
+            chat_provider: "openai_compatible".to_owned(),
+            chat_endpoint: server.base_url(),
+            chat_model: "qwen2.5:7b".to_owned(),
+            chat_api_key: String::new(),
+            ..Default::default()
+        };
+
+        let mut client = DialogueClient::new().expect("build client");
+        let resp = client
+            .chat("やあ", &cfg)
+            .await
+            .expect("local chat succeeds");
+        assert_eq!(resp.reply_text, "ローカルLLMからこんにちは！");
+        assert_eq!(resp.emotion, EmotionTag::Happy);
+        assert!(!server.requests()[0].headers.contains_key("authorization"));
+
+        cfg.chat_api_key = "sk-test-token".to_owned();
+        let _ = client
+            .chat("元気？", &cfg)
+            .await
+            .expect("auth chat succeeds");
+        assert_eq!(
+            server.requests()[1]
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer sk-test-token")
+        );
     }
 }

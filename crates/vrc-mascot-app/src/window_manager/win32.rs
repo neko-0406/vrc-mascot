@@ -298,17 +298,17 @@ pub fn query_window_rect(hwnd_raw: isize) -> Option<ScreenRect> {
 }
 
 /// Enumerates visible, non-minimized top-level windows in Z-order (front-to-back),
-/// excluding `exclude_hwnd`, tool windows, cloaked windows, and desktop shell windows.
-pub fn enumerate_visible_windows(exclude_hwnd: isize) -> Vec<ExternalWindowInfo> {
-    struct EnumCtx {
-        exclude_hwnd: isize,
+/// excluding `exclude_hwnds`, tool windows, cloaked windows, and desktop shell windows.
+pub fn enumerate_visible_windows(exclude_hwnds: &[isize]) -> Vec<ExternalWindowInfo> {
+    struct EnumCtx<'a> {
+        exclude_hwnds: &'a [isize],
         windows: Vec<ExternalWindowInfo>,
     }
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ctx = &mut *(lparam.0 as *mut EnumCtx);
+        let ctx = &mut *(lparam.0 as *mut EnumCtx<'_>);
         let hwnd_raw = hwnd.0 as isize;
-        if hwnd_raw == 0 || hwnd_raw == ctx.exclude_hwnd {
+        if hwnd_raw == 0 || ctx.exclude_hwnds.contains(&hwnd_raw) {
             return BOOL(1);
         }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
@@ -346,20 +346,23 @@ pub fn enumerate_visible_windows(exclude_hwnd: isize) -> Vec<ExternalWindowInfo>
     }
 
     let mut ctx = EnumCtx {
-        exclude_hwnd,
+        exclude_hwnds,
         windows: Vec::new(),
     };
     unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut EnumCtx as isize));
+        let _ = EnumWindows(
+            Some(enum_proc),
+            LPARAM(&mut ctx as *mut EnumCtx<'_> as isize),
+        );
     }
     ctx.windows
 }
 
 /// Returns information about the current foreground window and whether it covers its monitor fullscreen.
-pub fn get_foreground_window_info(exclude_hwnd: isize) -> Option<ForegroundWindowInfo> {
+pub fn get_foreground_window_info(exclude_hwnds: &[isize]) -> Option<ForegroundWindowInfo> {
     let hwnd = unsafe { GetForegroundWindow() };
     let hwnd_raw = hwnd.0 as isize;
-    if hwnd_raw == 0 || hwnd_raw == exclude_hwnd {
+    if hwnd_raw == 0 || exclude_hwnds.contains(&hwnd_raw) {
         return None;
     }
     unsafe {

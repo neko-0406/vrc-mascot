@@ -197,14 +197,26 @@ impl Default for MotionConfig {
     }
 }
 
-/// Dialogue LLM and Gemini Decisions API configuration (`CF-02`).
+fn default_chat_endpoint() -> String {
+    "https://generativelanguage.googleapis.com".to_owned()
+}
+
+fn default_decisions_provider() -> String {
+    "gemini".to_owned()
+}
+
+/// Dialogue LLM and Decisions AI configuration (`CF-02`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
     pub chat_provider: String,
+    #[serde(default = "default_chat_endpoint")]
+    pub chat_endpoint: String,
     pub chat_model: String,
     pub chat_api_key: String,
     pub decisions_enabled: bool,
+    #[serde(default = "default_decisions_provider")]
+    pub decisions_provider: String,
     pub decisions_endpoint: String,
     pub decisions_model: String,
     pub decisions_api_key: String,
@@ -218,9 +230,11 @@ impl Default for AiConfig {
     fn default() -> Self {
         Self {
             chat_provider: "gemini".to_owned(),
+            chat_endpoint: default_chat_endpoint(),
             chat_model: "gemini-2.5-flash".to_owned(),
             chat_api_key: String::new(),
             decisions_enabled: true,
+            decisions_provider: default_decisions_provider(),
             decisions_endpoint: "https://generativelanguage.googleapis.com".to_owned(),
             decisions_model: "gemini-2.5-flash-lite".to_owned(),
             decisions_api_key: String::new(),
@@ -409,5 +423,24 @@ mod tests {
                 .join("vrc-mascot")
                 .join("avatars")
         );
+    }
+
+    #[test]
+    fn legacy_ai_config_toml_deserializes_with_new_field_defaults() {
+        let legacy_toml = r#"
+[ai]
+chat_provider = "gemini"
+chat_model = "gemini-2.5-flash"
+decisions_enabled = true
+decisions_endpoint = "https://generativelanguage.googleapis.com"
+decisions_model = "gemini-2.5-flash-lite"
+"#;
+        let cfg: AppConfig = toml::from_str(legacy_toml).expect("parse legacy config");
+        assert_eq!(cfg.ai.chat_provider, "gemini");
+        assert_eq!(
+            cfg.ai.chat_endpoint,
+            "https://generativelanguage.googleapis.com"
+        );
+        assert_eq!(cfg.ai.decisions_provider, "gemini");
     }
 }
