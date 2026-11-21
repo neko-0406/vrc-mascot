@@ -1526,3 +1526,265 @@ MonoBehaviour:
     assert_eq!(m_on.expressions.menu[0].sub_menu.len(), 1);
     assert_eq!(m_on.expressions.menu[0].sub_menu[0].name, "Jacket");
 }
+
+#[test]
+fn fbx_prefab_instance_with_stripped_descriptor_external_materials_and_shift_jis_meta() {
+    let tmp = tempdir().expect("tempdir");
+    let proj = tmp.path().join("Proj");
+
+    let tex_guid = "f1000000000000000000000000000001";
+    let tex_path = proj.join("Assets/Textures/Body.png");
+    write_png(&tex_path, 16, 16);
+    write_meta(&tex_path, tex_guid);
+
+    // Non-UTF-8 Shift-JIS comment in .shader file should not crash or drop shader classification
+    let shader_guid = "f1000000000000000000000000000002";
+    let shader_path = proj.join("Assets/Shaders/lilToon.shader");
+    fs::create_dir_all(shader_path.parent().unwrap()).unwrap();
+    let mut shader_bytes = b"// \x93\xfa\x96\x7b\x8c\xea\x83R\x83\x81\x83\x93\x83g\n".to_vec();
+    shader_bytes.extend_from_slice(br#"Shader "lilToon" { Properties {} SubShader {} }"#);
+    fs::write(&shader_path, shader_bytes).unwrap();
+    write_meta(&shader_path, shader_guid);
+
+    let mat_guid = "f1000000000000000000000000000003";
+    let mat_path = proj.join("Assets/Materials/BodyMat.mat");
+    write_file(
+        &mat_path,
+        &format!(
+            r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  m_Name: BodyMat
+  m_Shader: {{fileID: 4800000, guid: {shader_guid}, type: 3}}
+  m_SavedProperties:
+    m_TexEnvs:
+    - _MainTex:
+        m_Texture: {{fileID: 2800000, guid: {tex_guid}, type: 3}}
+    m_Floats:
+    - _ShadowBorder: 0.45
+    m_Colors:
+    - _Color: {{r: 1, g: 1, b: 1, a: 1}}
+"#
+        ),
+    );
+    write_meta(&mat_path, mat_guid);
+
+    // FBX + .fbx.meta with externalObjects + Shift-JIS comment + humanDescription
+    let fbx_guid = "f1000000000000000000000000000004";
+    let fbx_path = proj.join("Assets/Model/Luchika.fbx");
+    write_file(&fbx_path, sample_ascii_fbx());
+    let fbx_meta_path = Path::new(&format!("{}.meta", fbx_path.display())).to_path_buf();
+    let mut fbx_meta_bytes = b"# \x83\x8b\x83`\x83J\n".to_vec();
+    fbx_meta_bytes.extend_from_slice(
+        format!(
+            r#"fileFormatVersion: 2
+guid: {fbx_guid}
+ModelImporter:
+  internalIDToNameTable: []
+  externalObjects:
+  - first:
+      type: UnityEngine:Material
+      assembly: UnityEngine.CoreModule
+      name: BodyMat
+    second: {{fileID: 2100000, guid: {mat_guid}, type: 2}}
+  fileIdsGeneration: 2
+  humanDescription:
+    human:
+    - boneName: Hips
+      humanName: Hips
+    - boneName: Head
+      humanName: Head
+"#
+        )
+        .as_bytes(),
+    );
+    fs::write(&fbx_meta_path, fbx_meta_bytes).unwrap();
+
+    // Prefab wrapping FBX via PrefabInstance & stripped root GameObject + Transform,
+    // attaching VRCAvatarDescriptor (precompiled DLL GUID) & unresolved VisemeSkinnedMesh stub
+    let prefab_guid = "f1000000000000000000000000000005";
+    let prefab_path = proj.join("Assets/Luchika.prefab");
+    write_file(
+        &prefab_path,
+        &format!(
+            r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1001 &1881738318541163860
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    m_TransformParent: {{fileID: 0}}
+    m_Modifications: []
+    m_RemovedComponents: []
+    m_AddedComponents:
+    - targetCorrespondingSourceObject: {{fileID: 919132149155446097, guid: {fbx_guid}, type: 3}}
+      insertIndex: -1
+      addedObject: {{fileID: 6231858688194118421}}
+  m_SourcePrefab: {{fileID: 100100000, guid: {fbx_guid}, type: 3}}
+--- !u!1 &1647243060384247813 stripped
+GameObject:
+  m_CorrespondingSourceObject: {{fileID: 919132149155446097, guid: {fbx_guid}, type: 3}}
+  m_PrefabInstance: {{fileID: 1881738318541163860}}
+--- !u!4 &2132452751112563391 stripped
+Transform:
+  m_CorrespondingSourceObject: {{fileID: -8679921383154817045, guid: {fbx_guid}, type: 3}}
+  m_PrefabInstance: {{fileID: 1881738318541163860}}
+--- !u!137 &917881535847583750 stripped
+SkinnedMeshRenderer:
+  m_CorrespondingSourceObject: {{fileID: 1630794972795428178, guid: {fbx_guid}, type: 3}}
+  m_PrefabInstance: {{fileID: 1881738318541163860}}
+--- !u!114 &6231858688194118421
+MonoBehaviour:
+  m_GameObject: {{fileID: 1647243060384247813}}
+  m_Enabled: 1
+  m_Script: {{fileID: 542108242, guid: 67cc4cb7839cd3741b63733d5adf0442, type: 3}}
+  lipSync: 3
+  VisemeSkinnedMesh: {{fileID: 917881535847583750}}
+  VisemeBlendShapes:
+  - vrc.v_sil
+  - vrc.v_pp
+  - vrc.v_ff
+  - vrc.v_th
+  - vrc.v_dd
+  - vrc.v_kk
+  - vrc.v_ch
+  - vrc.v_ss
+  - vrc.v_nn
+  - vrc.v_rr
+  - vrc.v_aa
+  baseAnimationLayers: []
+"#
+        ),
+    );
+    write_meta(&prefab_path, prefab_guid);
+
+    // Scene instantiating Prefab Variant and renaming root GameObject
+    let scene_rel = Path::new("Assets/RuchikaScene.unity");
+    let scene_path = proj.join(scene_rel);
+    write_file(
+        &scene_path,
+        &format!(
+            r#"%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1001 &477113033
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    m_TransformParent: {{fileID: 0}}
+    m_Modifications:
+    - target: {{fileID: 1647243060384247813, guid: {prefab_guid}, type: 3}}
+      propertyPath: m_Name
+      value: Luchika
+      objectReference: {{fileID: 0}}
+    m_RemovedComponents: []
+    m_AddedComponents: []
+  m_SourcePrefab: {{fileID: 100100000, guid: {prefab_guid}, type: 3}}
+"#
+        ),
+    );
+
+    let avatars = discover_avatars(&proj, scene_rel).expect("discover_avatars must succeed");
+    assert_eq!(avatars.len(), 1);
+    assert_eq!(avatars[0].name, "Luchika");
+    assert!(avatars[0].has_descriptor);
+
+    let out_dir = tmp.path().join("out_fbx_prefab");
+    let report = extract_avatar(
+        &ExtractOptions {
+            project_dir: proj,
+            scene_path: scene_rel.to_path_buf(),
+            avatar_name: "Luchika".to_owned(),
+            output_dir: out_dir,
+            modular_avatar_enabled: true,
+            max_texture_size: 2048,
+        },
+        |_| {},
+    )
+    .expect("extract_avatar must succeed on FBX-backed prefab");
+
+    assert!(report.glb_path.is_file());
+    let manifest = MascotManifest::load(&report.manifest_path).expect("load manifest");
+    assert_eq!(manifest.avatar_name, "Luchika");
+    assert_eq!(
+        manifest.humanoid_bones.get("Hips").map(String::as_str),
+        Some("Hips")
+    );
+    assert_eq!(
+        manifest.humanoid_bones.get("Head").map(String::as_str),
+        Some("Hips/Head")
+    );
+    let aa = manifest.viseme_map.aa.as_ref().expect("viseme aa resolved");
+    assert_eq!(aa.mesh, "Body");
+    assert_eq!(aa.blendshape, "vrc.v_aa");
+    assert_eq!(manifest.materials.len(), 1);
+    assert_eq!(manifest.materials[0].name, "BodyMat");
+    assert_eq!(manifest.materials[0].shader_family, ShaderFamily::LilToon);
+
+    let gltf_doc = gltf::Gltf::open(&report.glb_path).expect("valid glb");
+    assert_eq!(gltf_doc.meshes().count(), 1);
+    assert_eq!(gltf_doc.materials().count(), 1);
+}
+
+#[test]
+fn model_importer_meta_tables_and_binary_yaml_guard() {
+    use vrc_extractor::indexer::{parse_model_importer_meta_str, UnityYamlFile};
+    use vrc_extractor::ExtractorError;
+
+    let meta_yaml = r#"fileFormatVersion: 2
+guid: abcdef0123456789abcdef0123456789
+ModelImporter:
+  internalIDToNameTable:
+  - first:
+      1: 100001
+    second: //RootNode/Body
+  - first:
+      137: 13700001
+    second: Body
+  fileIDToRecycleName:
+    400002: Head
+  externalObjects:
+  - first:
+      type: UnityEngine:Material
+      assembly: UnityEngine.CoreModule
+      name: HairMat
+    second: {fileID: 2100000, guid: 11112222333344445555666677778888, type: 2}
+  humanDescription:
+    human:
+    - boneName: Head
+      humanName: Head
+"#;
+    let parsed = parse_model_importer_meta_str(meta_yaml, Path::new("Test.fbx.meta")).unwrap();
+    assert_eq!(parsed.internal_id_to_name.len(), 2);
+    assert_eq!(
+        parsed.recycle_names.get(&400002).map(String::as_str),
+        Some("Head")
+    );
+    let hair_ref = parsed.external_materials.get("HairMat").unwrap();
+    assert_eq!(
+        hair_ref.guid.as_deref(),
+        Some("11112222333344445555666677778888")
+    );
+    assert_eq!(
+        parsed.human_description.get("Head").map(String::as_str),
+        Some("Head")
+    );
+
+    let tmp = tempdir().unwrap();
+    let bin_fbx = tmp.path().join("bin.fbx");
+    fs::write(&bin_fbx, b"Kaydara FBX Binary  \x00\x1a\x00\xff\xfe").unwrap();
+    let err = UnityYamlFile::load(&bin_fbx).unwrap_err();
+    assert!(matches!(err, ExtractorError::YamlParse { .. }));
+
+    // Stray Shift-JIS bytes inside a YAML comment should load lossily without failing
+    let sjis_yaml = tmp.path().join("sjis.asset");
+    let mut yaml_bytes =
+        b"%YAML 1.1\n# \x93\xfa\x96\x7b\x8c\xea\n--- !u!114 &1\nMonoBehaviour:\n  m_Name: Ok\n"
+            .to_vec();
+    fs::write(&sjis_yaml, &yaml_bytes).unwrap();
+    yaml_bytes.clear();
+    let loaded = UnityYamlFile::load(&sjis_yaml).unwrap();
+    assert_eq!(loaded.documents.len(), 1);
+}

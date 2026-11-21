@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vrc_schema::ShaderFamily;
-use yaml_rust2::YamlLoader;
+use yaml_rust2::{Yaml, YamlLoader};
 
+use super::unity_yaml::UnityRef;
 use crate::error::ExtractorError;
 
 /// Known Modular Avatar component categories resolved via script GUID or field signature.
@@ -170,7 +171,7 @@ impl AssetIndex {
     }
 
     fn index_meta_file(&mut self, meta_path: &Path, overwrite: bool) -> Result<(), ExtractorError> {
-        let Ok(content) = fs::read_to_string(meta_path) else {
+        let Ok(content) = read_text_lossy(meta_path) else {
             return Ok(());
         };
         let Some(guid) = extract_guid_from_meta(&content) else {
@@ -307,11 +308,118 @@ pub fn extract_guid_from_meta(meta_content: &str) -> Option<String> {
     None
 }
 
+/// Parsed `ModelImporter` metadata from an `.fbx.meta` file.
+#[derive(Debug, Clone, Default)]
+pub struct ModelImporterMeta {
+    /// `(class_id, file_id, name)` entries from `ModelImporter.internalIDToNameTable`.
+    pub internal_id_to_name: Vec<(i64, i64, String)>,
+    /// `file_id -> name` entries from `ModelImporter.fileIDToRecycleName`.
+    pub recycle_names: HashMap<i64, String>,
+    /// `material_name -> UnityRef` entries from `ModelImporter.externalObjects`.
+    pub external_materials: HashMap<String, UnityRef>,
+    /// `humanName -> boneName` entries from `ModelImporter.humanDescription.human`.
+    pub human_description: BTreeMap<String, String>,
+}
+
+/// Parses `ModelImporter` tables (`internalIDToNameTable`, `fileIDToRecycleName`, `externalObjects`,
+/// and `humanDescription.human`) from an `.fbx.meta` file.
+pub fn parse_model_importer_meta(meta_path: &Path) -> Result<ModelImporterMeta, ExtractorError> {
+    let raw = read_text_lossy(meta_path)?;
+    parse_model_importer_meta_str(&raw, meta_path)
+}
+
+/// Parses `ModelImporter` tables from raw `.fbx.meta` YAML text.
+pub fn parse_model_importer_meta_str(
+    raw: &str,
+    path_for_error: &Path,
+) -> Result<ModelImporterMeta, ExtractorError> {
+    let clean = raw.trim_start_matches('\u{feff}');
+    let docs = YamlLoader::load_from_str(clean).map_err(|e| ExtractorError::YamlParse {
+        path: path_for_error.to_path_buf(),
+        message: e.to_string(),
+    })?;
+
+    let mut meta = ModelImporterMeta::default();
+    let Some(doc) = docs.first() else {
+        return Ok(meta);
+    };
+    let importer = &doc["ModelImporter"];
+
+    if let Some(entries) = importer["internalIDToNameTable"].as_vec() {
+        for entry in entries {
+            let name = entry["second"].as_str().map(str::trim).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(first_map) = entry["first"].as_hash() {
+                for (k, v) in first_map {
+                    let Some(class_id) = yaml_num_as_i64(k) else {
+                        continue;
+                    };
+                    let Some(file_id) = yaml_num_as_i64(v) else {
+                        continue;
+                    };
+                    meta.internal_id_to_name
+                        .push((class_id, file_id, name.to_owned()));
+                }
+            }
+        }
+    }
+
+    if let Some(recycle_map) = importer["fileIDToRecycleName"].as_hash() {
+        for (k, v) in recycle_map {
+            let Some(file_id) = yaml_num_as_i64(k) else {
+                continue;
+            };
+            if let Some(name) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                meta.recycle_names.insert(file_id, name.to_owned());
+            }
+        }
+    }
+
+    if let Some(ext_list) = importer["externalObjects"].as_vec() {
+        for entry in ext_list {
+            let first = &entry["first"];
+            let type_name = first["type"].as_str().map(str::trim).unwrap_or("");
+            let is_material = type_name.is_empty() || type_name.ends_with("Material");
+            if !is_material {
+                continue;
+            }
+            let Some(name) = first["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if let Some(u_ref) = UnityRef::from_yaml(&entry["second"]) {
+                if !u_ref.is_null() {
+                    meta.external_materials.insert(name.to_owned(), u_ref);
+                }
+            }
+        }
+    }
+
+    let human_list = &importer["humanDescription"]["human"];
+    if let Some(entries) = human_list.as_vec() {
+        for entry in entries {
+            let human_name = entry["humanName"].as_str().map(str::trim).unwrap_or("");
+            let bone_name = entry["boneName"].as_str().map(str::trim).unwrap_or("");
+            if !human_name.is_empty() && !bone_name.is_empty() {
+                meta.human_description
+                    .insert(human_name.to_owned(), bone_name.to_owned());
+            }
+        }
+    }
+
+    Ok(meta)
+}
+
 /// Parses `ModelImporter.humanDescription.human` from an `.fbx.meta` file into `humanName -> boneName`.
 pub fn parse_fbx_meta_human_description(
     meta_path: &Path,
 ) -> Result<BTreeMap<String, String>, ExtractorError> {
-    let raw = fs::read_to_string(meta_path)?;
+    let raw = read_text_lossy(meta_path)?;
     parse_fbx_meta_human_description_str(&raw, meta_path)
 }
 
@@ -320,29 +428,24 @@ pub fn parse_fbx_meta_human_description_str(
     raw: &str,
     path_for_error: &Path,
 ) -> Result<BTreeMap<String, String>, ExtractorError> {
-    let clean = raw.trim_start_matches('\u{feff}');
-    let docs = YamlLoader::load_from_str(clean).map_err(|e| ExtractorError::YamlParse {
-        path: path_for_error.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    Ok(parse_model_importer_meta_str(raw, path_for_error)?.human_description)
+}
 
-    let mut result = BTreeMap::new();
-    let Some(doc) = docs.first() else {
-        return Ok(result);
-    };
-
-    let human_list = &doc["ModelImporter"]["humanDescription"]["human"];
-    if let Some(entries) = human_list.as_vec() {
-        for entry in entries {
-            let human_name = entry["humanName"].as_str().map(str::trim).unwrap_or("");
-            let bone_name = entry["boneName"].as_str().map(str::trim).unwrap_or("");
-            if !human_name.is_empty() && !bone_name.is_empty() {
-                result.insert(human_name.to_owned(), bone_name.to_owned());
-            }
-        }
+fn yaml_num_as_i64(yaml: &Yaml) -> Option<i64> {
+    match yaml {
+        Yaml::Integer(i) => Some(*i),
+        Yaml::String(s) => s.trim().parse::<i64>().ok(),
+        Yaml::Real(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
     }
+}
 
-    Ok(result)
+fn read_text_lossy(path: &Path) -> Result<String, std::io::Error> {
+    let bytes = fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    })
 }
 
 fn meta_path_to_asset_path(meta_path: &Path) -> PathBuf {
@@ -407,7 +510,7 @@ pub fn classify_shader_name(lower_name: &str) -> Option<ShaderFamily> {
 }
 
 fn read_shader_header_name(shader_path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(shader_path).ok()?;
+    let raw = read_text_lossy(shader_path).ok()?;
     for line in raw.lines().take(16) {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("Shader") {

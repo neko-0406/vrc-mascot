@@ -42,6 +42,13 @@ pub enum AppCommand {
     Shutdown,
 }
 
+/// Destination field for an asynchronous folder picker dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderPickerTarget {
+    ImportProjectDir,
+    ExtractOutputDir,
+}
+
 /// Events emitted from the Tokio background worker back to [`AppState`].
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -79,6 +86,10 @@ pub enum AppEvent {
     ImportProgress(ExtractProgress),
     ImportFinished(Result<ExtractReport, String>),
     ConfigSaved(Result<(), String>),
+    FolderPicked {
+        target: FolderPickerTarget,
+        path: Option<PathBuf>,
+    },
 }
 
 /// Deferred perch movement requested by Decisions AI or user actions.
@@ -153,12 +164,14 @@ pub struct AppState {
     pub fps_estimate: f32,
     pub import_status: ImportJobStatus,
     pub import_form: ImportFormState,
+    pub folder_picker_open: bool,
     pub status_notice: Option<String>,
     pub pending_model_reload: Option<(AvatarModel, MascotManifest)>,
     pub pending_perch_action: Option<PendingPerchAction>,
     pub menu_dirty: bool,
     pub status_window_visible: bool,
     cmd_tx: tokio_mpsc::UnboundedSender<AppCommand>,
+    event_tx: std_mpsc::Sender<AppEvent>,
     event_rx: std_mpsc::Receiver<AppEvent>,
     _runtime: Option<tokio::runtime::Runtime>,
 }
@@ -235,13 +248,14 @@ impl AppState {
 
         let ai_cfg = config.ai.clone();
         let voice_cfg = config.voice.clone();
+        let worker_event_tx = event_tx.clone();
         runtime.spawn(async move {
             run_background_worker(
                 ai_cfg,
                 voice_cfg,
                 dialogue_endpoint_override,
                 cmd_rx,
-                event_tx,
+                worker_event_tx,
             )
             .await;
         });
@@ -275,12 +289,14 @@ impl AppState {
             fps_estimate: 60.0,
             import_status: ImportJobStatus::Idle,
             import_form,
+            folder_picker_open: false,
             status_notice: None,
             pending_model_reload: Some((model, manifest)),
             pending_perch_action: None,
             menu_dirty: false,
             status_window_visible,
             cmd_tx,
+            event_tx,
             event_rx,
             _runtime: Some(runtime),
         })
@@ -321,6 +337,29 @@ impl AppState {
     /// Requests a VOICEVOX Engine health & speaker list check.
     pub fn check_voicevox(&mut self) {
         let _ = self.cmd_tx.send(AppCommand::CheckVoicevox);
+    }
+
+    /// Opens the OS folder picker on a dedicated STA thread so `winit` `RedrawRequested` / `WM_PAINT` is never blocked.
+    pub fn open_folder_picker(&mut self, target: FolderPickerTarget, initial_dir: Option<PathBuf>) {
+        if self.folder_picker_open {
+            return;
+        }
+        self.folder_picker_open = true;
+        let tx = self.event_tx.clone();
+        let spawn_res = std::thread::Builder::new()
+            .name("vrc-folder-picker".to_owned())
+            .spawn(move || {
+                let mut dialog = rfd::FileDialog::new();
+                if let Some(dir) = initial_dir.filter(|p| p.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                let path = dialog.pick_folder();
+                let _ = tx.send(AppEvent::FolderPicked { target, path });
+            });
+        if let Err(err) = spawn_res {
+            self.folder_picker_open = false;
+            self.status_notice = Some(format!("フォルダ選択ダイアログ起動失敗: {err}"));
+        }
     }
 
     /// Triggers asynchronous Unity scene discovery inside `project_dir`.
@@ -692,6 +731,21 @@ impl AppState {
                     self.status_notice = Some(format!("設定保存エラー: {err}"));
                 }
             },
+            AppEvent::FolderPicked { target, path } => {
+                self.folder_picker_open = false;
+                if let Some(folder) = path {
+                    match target {
+                        FolderPickerTarget::ImportProjectDir => {
+                            self.import_form.project_dir = folder.display().to_string();
+                            self.discover_scenes_in(folder);
+                        }
+                        FolderPickerTarget::ExtractOutputDir => {
+                            self.draft_config.avatar_import.extract_output_dir =
+                                folder.display().to_string();
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1356,5 +1410,73 @@ mod tests {
         let _ = std::net::TcpStream::connect(base_url.trim_start_matches("http://"))
             .and_then(|mut s| s.write_all(b"GET /__shutdown HTTP/1.1\r\n\r\n"));
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn folder_picked_events_update_state_and_reset_open_guard() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("vrc_mascot_folder_picker_test_{}", now_epoch_ms()));
+        let proj = tmp_root.join("UnityProj");
+        let scene_file = proj.join("Assets/Main.unity");
+        std::fs::create_dir_all(scene_file.parent().unwrap()).unwrap();
+        std::fs::write(&scene_file, "%YAML 1.1\n").unwrap();
+
+        let cfg = AppConfig::default();
+        let (model, manifest) = AvatarModel::procedural_fallback();
+        let mut state = AppState::build_with_parts(
+            cfg,
+            AvatarRegistry::new(tmp_root.join("avatars")),
+            model,
+            manifest,
+            None,
+            None,
+            SpeechPlayer::new_headless(),
+            AudioLinkCapture::new(false),
+            false,
+            None,
+        )
+        .expect("build AppState");
+
+        // Duplicate-open guard: when folder_picker_open is already true, open_folder_picker returns immediately
+        state.folder_picker_open = true;
+        state.open_folder_picker(FolderPickerTarget::ImportProjectDir, None);
+        assert!(state.folder_picker_open);
+
+        // Cancelled dialog resets guard without altering fields
+        state.apply_event(AppEvent::FolderPicked {
+            target: FolderPickerTarget::ExtractOutputDir,
+            path: None,
+        });
+        assert!(!state.folder_picker_open);
+
+        // ExtractOutputDir selection updates draft_config
+        let out_dir = tmp_root.join("ExtractedAvatars");
+        state.folder_picker_open = true;
+        state.apply_event(AppEvent::FolderPicked {
+            target: FolderPickerTarget::ExtractOutputDir,
+            path: Some(out_dir.clone()),
+        });
+        assert!(!state.folder_picker_open);
+        assert_eq!(
+            state.draft_config.avatar_import.extract_output_dir,
+            out_dir.display().to_string()
+        );
+
+        // ImportProjectDir selection updates project_dir and triggers async scene discovery
+        state.folder_picker_open = true;
+        state.apply_event(AppEvent::FolderPicked {
+            target: FolderPickerTarget::ImportProjectDir,
+            path: Some(proj.clone()),
+        });
+        assert!(!state.folder_picker_open);
+        assert_eq!(state.import_form.project_dir, proj.display().to_string());
+        wait_until(&mut state, |s| !s.import_form.discovered_scenes.is_empty());
+        assert_eq!(
+            state.import_form.discovered_scenes,
+            vec![PathBuf::from("Assets/Main.unity")]
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

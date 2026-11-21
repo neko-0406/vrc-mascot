@@ -48,10 +48,11 @@ pub struct FbxSkinData {
     pub inverse_bind_matrices: Vec<[f32; 16]>,
 }
 
-/// Extracted mesh with primitives, morph target names, and optional skinning.
+/// Extracted mesh with primitives, material slot names, morph target names, and optional skinning.
 #[derive(Debug, Clone)]
 pub struct FbxMeshData {
     pub name: String,
+    pub material_names: Vec<String>,
     pub primitives: Vec<FbxPrimitive>,
     pub morph_target_names: Vec<String>,
     pub skin: Option<FbxSkinData>,
@@ -77,6 +78,19 @@ pub fn unity_lh_to_gltf_rh_transform(
 
 /// Loads an FBX file using `ufbx`, normalizing coordinates to glTF RH Y-up meters.
 pub fn load_fbx_scene(fbx_path: &Path) -> Result<FbxSceneData, ExtractorError> {
+    load_fbx_with_opts(fbx_path, false)
+}
+
+/// Loads only the FBX node hierarchy and mesh/material metadata (`ignore_geometry: true`)
+/// for fast scene/prefab resolution without decoding vertex buffers.
+pub fn load_fbx_hierarchy(fbx_path: &Path) -> Result<FbxSceneData, ExtractorError> {
+    load_fbx_with_opts(fbx_path, true)
+}
+
+fn load_fbx_with_opts(
+    fbx_path: &Path,
+    ignore_geometry: bool,
+) -> Result<FbxSceneData, ExtractorError> {
     let path_str = fbx_path.to_str().ok_or_else(|| ExtractorError::FbxLoad {
         path: fbx_path.to_path_buf(),
         message: "non-UTF-8 FBX file path".to_owned(),
@@ -86,10 +100,11 @@ pub fn load_fbx_scene(fbx_path: &Path) -> Result<FbxSceneData, ExtractorError> {
         target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
         target_unit_meters: 1.0,
         space_conversion: ufbx::SpaceConversion::ModifyGeometry,
-        generate_missing_normals: true,
-        normalize_normals: true,
-        normalize_tangents: true,
-        clean_skin_weights: true,
+        generate_missing_normals: !ignore_geometry,
+        normalize_normals: !ignore_geometry,
+        normalize_tangents: !ignore_geometry,
+        clean_skin_weights: !ignore_geometry,
+        ignore_geometry,
         ignore_animation: true,
         ..Default::default()
     };
@@ -106,7 +121,11 @@ pub fn load_fbx_scene(fbx_path: &Path) -> Result<FbxSceneData, ExtractorError> {
         let mesh: &ufbx::Mesh = mesh_ref;
         let idx = meshes.len();
         mesh_id_to_index.insert(mesh.element.typed_id, idx);
-        meshes.push(extract_mesh(mesh));
+        if ignore_geometry {
+            meshes.push(extract_mesh_metadata(mesh));
+        } else {
+            meshes.push(extract_mesh(mesh));
+        }
     }
 
     // Map ufbx Node typed_id -> node index (skip synthetic root_node if unnamed or keep consistent)
@@ -157,8 +176,27 @@ pub fn load_fbx_scene(fbx_path: &Path) -> Result<FbxSceneData, ExtractorError> {
     Ok(FbxSceneData { nodes, meshes })
 }
 
+fn collect_mesh_material_names(mesh: &ufbx::Mesh) -> Vec<String> {
+    mesh.materials
+        .as_ref()
+        .iter()
+        .map(|m| m.element.name.to_string())
+        .collect()
+}
+
+fn extract_mesh_metadata(mesh: &ufbx::Mesh) -> FbxMeshData {
+    FbxMeshData {
+        name: mesh.element.name.to_string(),
+        material_names: collect_mesh_material_names(mesh),
+        primitives: Vec::new(),
+        morph_target_names: Vec::new(),
+        skin: None,
+    }
+}
+
 fn extract_mesh(mesh: &ufbx::Mesh) -> FbxMeshData {
     let mesh_name = mesh.element.name.to_string();
+    let material_names = collect_mesh_material_names(mesh);
 
     // 1. Extract skinning clusters & per-control-vertex top-4 normalized weights
     let (skin_data, ctrl_skin_weights) = extract_skinning(mesh);
@@ -220,6 +258,7 @@ fn extract_mesh(mesh: &ufbx::Mesh) -> FbxMeshData {
 
     FbxMeshData {
         name: mesh_name,
+        material_names,
         primitives,
         morph_target_names,
         skin: skin_data,
