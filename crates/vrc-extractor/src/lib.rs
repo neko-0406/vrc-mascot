@@ -286,7 +286,8 @@ where
     }
 
     report_progress("Extracting PhysBones & Colliders", 0.70);
-    let (phys_bones, colliders) = extract_physbones_and_colliders(&hierarchy, avatar_root, &index);
+    let (mut phys_bones, colliders) =
+        extract_physbones_and_colliders(&hierarchy, avatar_root, &index);
 
     report_progress("Loading FBX meshes & Materials", 0.80);
     let (glb_input, mut material_defs) = build_glb_export_input(
@@ -296,6 +297,16 @@ where
         opts.max_texture_size,
         &mut warnings,
     )?;
+
+    if phys_bones.is_empty() {
+        phys_bones = generate_fallback_physbones(&glb_input.nodes, &humanoid_bones);
+        if !phys_bones.is_empty() {
+            warnings.push(format!(
+                "Generated {} fallback PhysBone chains (FBX uses fileIdsGeneration: 2 without internalIDToNameTable)",
+                phys_bones.len()
+            ));
+        }
+    }
 
     report_progress("Exporting avatar.glb & mascot_manifest.json", 0.90);
     fs::create_dir_all(&opts.output_dir)?;
@@ -832,4 +843,152 @@ fn find_viseme_mesh_by_blendshapes<'a>(
         })
         .max_by_key(|(hits, _)| *hits)
         .map(|(_, m)| m)
+}
+
+fn generate_fallback_physbones(
+    nodes: &[GlbNodeInput],
+    humanoid_bones: &BTreeMap<String, String>,
+) -> Vec<vrc_schema::PhysBoneDef> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut full_paths = vec![String::new(); nodes.len()];
+    let mut parents = vec![None; nodes.len()];
+    for (idx, n) in nodes.iter().enumerate() {
+        parents[idx] = n.parent;
+    }
+    for (idx, path_slot) in full_paths.iter_mut().enumerate() {
+        let mut parts = Vec::new();
+        let mut cur = Some(idx);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            if guard > nodes.len() {
+                break;
+            }
+            guard += 1;
+            parts.push(nodes[c].name.as_str());
+            cur = parents[c];
+        }
+        parts.reverse();
+        *path_slot = parts.join("/");
+    }
+
+    let humanoid_paths: HashSet<&str> = humanoid_bones.values().map(String::as_str).collect();
+    let sway_keywords = [
+        "ear",
+        "tail",
+        "pocketstrap",
+        "corependant",
+        "webbing",
+        "ribbon",
+        "skirt",
+        "ahoge",
+        "coat_sway",
+    ];
+
+    let mut out = Vec::new();
+    let mut covered_roots: HashSet<usize> = HashSet::new();
+
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.children.is_empty() || node.mesh.is_some() {
+            continue;
+        }
+        let path = full_paths[idx].as_str();
+        if humanoid_paths.contains(path) {
+            continue;
+        }
+        // Skip if an ancestor is already selected as a PhysBone root.
+        let mut has_covered_ancestor = false;
+        let mut p = parents[idx];
+        let mut guard = 0;
+        while let Some(anc) = p {
+            if guard > nodes.len() {
+                break;
+            }
+            guard += 1;
+            if covered_roots.contains(&anc) {
+                has_covered_ancestor = true;
+                break;
+            }
+            p = parents[anc];
+        }
+        if has_covered_ancestor {
+            continue;
+        }
+
+        let parent_name_lower = parents[idx]
+            .and_then(|p_idx| nodes.get(p_idx))
+            .map(|p_node| p_node.name.to_ascii_lowercase())
+            .unwrap_or_default();
+        let name_lower = node.name.to_ascii_lowercase();
+
+        let is_sway_child = parent_name_lower == "hair_root" || parent_name_lower == "coat_root";
+        let matches_keyword = sway_keywords.iter().any(|kw| name_lower.contains(kw))
+            || (name_lower.starts_with("hair_") && name_lower != "hair_root");
+
+        if is_sway_child || matches_keyword {
+            covered_roots.insert(idx);
+            out.push(vrc_schema::PhysBoneDef {
+                root_node: path.to_owned(),
+                pull: 0.25,
+                spring: 0.45,
+                stiffness: 0.2,
+                immovable: 0.15,
+                gravity: 0.08,
+                gravity_falloff: 0.5,
+                allow_grabbing: true,
+                allow_posing: false,
+                ..Default::default()
+            });
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exporter::glb::GlbNodeInput;
+
+    fn make_node(name: &str, parent: Option<usize>, children: Vec<usize>) -> GlbNodeInput {
+        GlbNodeInput {
+            name: name.to_owned(),
+            parent,
+            children,
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            mesh: None,
+            skin: None,
+        }
+    }
+
+    #[test]
+    fn generate_fallback_physbones_selects_hair_coat_and_excludes_humanoid() {
+        let nodes = vec![
+            make_node("Armature", None, vec![1]),        // 0
+            make_node("Head", Some(0), vec![2, 3]),      // 1
+            make_node("Hair_Root", Some(1), vec![4, 5]), // 2
+            make_node("Coat_Root", Some(1), vec![6]),    // 3
+            make_node("Front_L", Some(2), vec![7]),      // 4 (Hair_Root child with child)
+            make_node("Leaf_Only", Some(2), vec![]),     // 5 (no children -> skipped)
+            make_node("Hood_L", Some(3), vec![8]),       // 6 (Coat_Root child with child)
+            make_node("Front_L_Tip", Some(4), vec![]),   // 7
+            make_node("Hood_L_End", Some(6), vec![]),    // 8
+        ];
+        let mut humanoid = BTreeMap::new();
+        humanoid.insert("Head".to_owned(), "Armature/Head".to_owned());
+
+        let defs = generate_fallback_physbones(&nodes, &humanoid);
+        let roots: Vec<&str> = defs.iter().map(|d| d.root_node.as_str()).collect();
+        assert_eq!(
+            roots,
+            vec![
+                "Armature/Head/Hair_Root/Front_L",
+                "Armature/Head/Coat_Root/Hood_L"
+            ]
+        );
+    }
 }

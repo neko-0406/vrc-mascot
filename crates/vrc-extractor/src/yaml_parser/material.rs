@@ -63,12 +63,17 @@ pub fn parse_material_asset(
     let floats = collect_saved_property_map(&saved["m_Floats"]);
     let colors = collect_saved_property_map(&saved["m_Colors"]);
 
-    let shader_name_hint = shader_guid
+    let shader_path_hint = shader_guid
         .as_deref()
         .and_then(|g| index.resolve_guid(g))
         .and_then(|p| p.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+    let shader_header_hint = shader_guid
+        .as_deref()
+        .and_then(|g| index.shader_header_by_guid(g))
+        .unwrap_or_default();
+    let shader_name_hint = format!("{shader_path_hint} {shader_header_hint}");
 
     let shader_family = detect_shader_family(
         shader_guid.as_deref(),
@@ -429,10 +434,17 @@ fn infer_alpha_mode(
             _ => {}
         }
     }
-    if shader_name_hint.contains("transparent") {
+    if shader_name_hint.contains("transparent")
+        || shader_name_hint.contains("lts_trans")
+        || get_float(floats, "_DstBlend").is_some_and(|v| v > 0.5)
+    {
         return AlphaMode::Blend;
     }
-    if shader_name_hint.contains("cutout") || get_bool(floats, "_AlphaCutout").unwrap_or(false) {
+    if shader_name_hint.contains("cutout")
+        || shader_name_hint.contains("lts_cut")
+        || get_bool(floats, "_AlphaCutout").unwrap_or(false)
+        || get_float(floats, "_AlphaMaskMode").is_some_and(|v| v > 0.5)
+    {
         return AlphaMode::Mask;
     }
     if custom_rq >= 2900 {
@@ -487,4 +499,33 @@ fn get_bool(floats: &HashMap<String, &Yaml>, key: &str) -> Option<bool> {
 
 fn get_color(colors: &HashMap<String, &Yaml>, key: &str) -> Option<[f32; 4]> {
     colors.get(key).and_then(|y| yaml_as_color(y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_alpha_mode_detects_liltoon_transparent_and_cutout() {
+        let empty = HashMap::new();
+        assert_eq!(infer_alpha_mode("lts_trans", &empty, -1), AlphaMode::Blend);
+        assert_eq!(infer_alpha_mode("lts_cut", &empty, -1), AlphaMode::Mask);
+        assert_eq!(infer_alpha_mode("liltoon", &empty, -1), AlphaMode::Opaque);
+
+        let dst_blend_val = Yaml::Real("10".to_owned());
+        let mut floats_blend = HashMap::new();
+        floats_blend.insert("_DstBlend".to_owned(), &dst_blend_val);
+        assert_eq!(
+            infer_alpha_mode("liltoon", &floats_blend, -1),
+            AlphaMode::Blend
+        );
+
+        let alpha_mask_val = Yaml::Integer(1);
+        let mut floats_mask = HashMap::new();
+        floats_mask.insert("_AlphaMaskMode".to_owned(), &alpha_mask_val);
+        assert_eq!(
+            infer_alpha_mode("liltoon", &floats_mask, -1),
+            AlphaMode::Mask
+        );
+    }
 }

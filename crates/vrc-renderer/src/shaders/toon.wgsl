@@ -160,27 +160,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light_energy = frame.light_color.rgb * frame.light_dir.w + vec3<f32>(frame.light_color.a);
     var color_rgb = lit_rgb * light_energy;
 
-    // Rim lighting
+    // Rim lighting (lilToon-compatible clamped border/blur so border=0 never washes front faces)
     if (material.rim_params.x > 0.5) {
         let fresnel_power = max(material.rim_params.w, 0.1);
-        let ndotv = clamp(dot(n, v), 0.0, 1.0);
-        let fresnel = pow(1.0 - ndotv, fresnel_power);
+        let ndotv = clamp(abs(dot(n, v)), 0.0, 1.0);
+        let fresnel = pow(clamp(1.0 - ndotv, 0.0, 1.0), fresnel_power);
         let rim_border = material.rim_params.y;
         let rim_blur = max(material.rim_params.z, 0.001);
-        let rim_mask = smoothstep(rim_border - rim_blur, rim_border + rim_blur, fresnel);
-        color_rgb += material.rim_color.rgb * (rim_mask * material.rim_color.a);
+        let rim_min = clamp(rim_border - rim_blur * 0.5, 0.0, 1.0);
+        let rim_max = clamp(rim_border + rim_blur * 0.5, 0.0, 1.0);
+        var rim_mask = 0.0;
+        if (fresnel > 0.0001) {
+            if (rim_max > rim_min + 1e-5) {
+                rim_mask = smoothstep(rim_min, rim_max, fresnel);
+            } else {
+                rim_mask = step(rim_min, fresnel);
+            }
+        }
+        let rim_shadow_atten = mix(0.5, 1.0, shadow1_factor);
+        color_rgb += material.rim_color.rgb * (rim_mask * material.rim_color.a * rim_shadow_atten) * light_energy;
     }
 
-    // MatCap blend
+    // MatCap blend (lilToon modes: 0=Normal, 1=Add, 2=Screen, 3=Multiply)
     if (material.matcap_emission.x > 0.5) {
-        let mc = matcap_sample.rgb * material.matcap_color.rgb * material.matcap_color.a;
+        let mc_rgb = matcap_sample.rgb * material.matcap_color.rgb;
+        let mc_alpha = clamp(material.matcap_color.a, 0.0, 1.0);
         let blend_mode = material.matcap_emission.y;
         if (blend_mode < 0.5) {
-            color_rgb += mc;
+            color_rgb = mix(color_rgb, mc_rgb * light_energy, mc_alpha);
         } else if (blend_mode < 1.5) {
-            color_rgb *= mix(vec3<f32>(1.0), mc, 0.5);
+            color_rgb += mc_rgb * mc_alpha * light_energy;
+        } else if (blend_mode < 2.5) {
+            let mc_lit = mc_rgb * light_energy;
+            let screened = max(color_rgb + mc_lit - color_rgb * mc_lit, color_rgb);
+            color_rgb = mix(color_rgb, screened, mc_alpha);
         } else {
-            color_rgb = 1.0 - (1.0 - color_rgb) * (1.0 - mc);
+            color_rgb = mix(color_rgb, color_rgb * mc_rgb, mc_alpha);
         }
     }
 
