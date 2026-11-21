@@ -73,7 +73,17 @@ impl UnityYamlFile {
     /// Reads and parses a Unity YAML file from disk.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ExtractorError> {
         let path = path.as_ref();
-        let raw = fs::read_to_string(path)?;
+        let bytes = fs::read(path)?;
+        if is_likely_binary_asset(&bytes) {
+            return Err(ExtractorError::YamlParse {
+                path: path.to_path_buf(),
+                message: "file appears to be binary (not Unity text YAML)".to_owned(),
+            });
+        }
+        let raw = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        };
         Self::parse_str(&raw, path)
     }
 
@@ -143,6 +153,18 @@ impl UnityYamlFile {
     pub fn resolve_stripped(&self, file_id: i64) -> Option<&StrippedRef> {
         self.get(file_id).and_then(|doc| doc.stripped_ref.as_ref())
     }
+}
+
+fn is_likely_binary_asset(bytes: &[u8]) -> bool {
+    let prefix = &bytes[..bytes.len().min(512)];
+    if prefix.starts_with(b"Kaydara FBX Binary")
+        || prefix.starts_with(b"\x89PNG\r\n\x1a\n")
+        || prefix.starts_with(b"UnityFS")
+        || prefix.starts_with(b"PK\x03\x04")
+    {
+        return true;
+    }
+    prefix.contains(&0)
 }
 
 struct RawChunk {

@@ -21,6 +21,7 @@ pub struct AvatarDescriptorData {
     pub expressions_menu_guid: Option<String>,
     pub expression_parameters_guid: Option<String>,
     pub viseme_map: VisemeMap,
+    pub viseme_blend_shapes: Vec<String>,
     pub left_eye_node: Option<String>,
     pub right_eye_node: Option<String>,
 }
@@ -138,39 +139,15 @@ pub fn extract_avatar_descriptor_data(
         .and_then(|(go_id, _)| hierarchy.nodes.get(&go_id))
         .map(|n| n.name.clone());
 
-    if let (Some(mesh_name), Some(shapes)) = (
-        viseme_mesh_name,
-        yaml_get(&desc.data, "VisemeBlendShapes").and_then(|v| v.as_vec()),
-    ) {
+    if let Some(shapes) = yaml_get(&desc.data, "VisemeBlendShapes").and_then(|v| v.as_vec()) {
         let shape_names: Vec<String> = shapes
             .iter()
             .map(|s| yaml_as_string(s).unwrap_or_default())
             .collect();
-        let make_binding = |idx: usize, fallback_suffix: &str| -> Option<BlendShapeBinding> {
-            let name = shape_names
-                .get(idx)
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    shape_names
-                        .iter()
-                        .find(|s| s.to_ascii_lowercase().ends_with(fallback_suffix))
-                        .cloned()
-                })?;
-            Some(BlendShapeBinding {
-                mesh: mesh_name.clone(),
-                blendshape: name,
-            })
-        };
-
-        out.viseme_map = VisemeMap {
-            sil: make_binding(0, "sil"),
-            aa: make_binding(10, "_aa"),
-            ee: make_binding(11, "_ee"),
-            ih: make_binding(12, "_ih"),
-            oh: make_binding(13, "_oh"),
-            ou: make_binding(14, "_ou"),
-        };
+        if let Some(ref mesh_name) = viseme_mesh_name {
+            out.viseme_map = build_viseme_map_for_mesh(mesh_name, &shape_names);
+        }
+        out.viseme_blend_shapes = shape_names;
     }
 
     // Eye look bones (optional fallback for humanoid_bones)
@@ -189,6 +166,35 @@ pub fn extract_avatar_descriptor_data(
     }
 
     out
+}
+
+/// Builds a [`VisemeMap`] binding `VRCAvatarDescriptor.VisemeBlendShapes` entries to `mesh_name`.
+pub fn build_viseme_map_for_mesh(mesh_name: &str, shape_names: &[String]) -> VisemeMap {
+    let make_binding = |idx: usize, fallback_suffix: &str| -> Option<BlendShapeBinding> {
+        let name = shape_names
+            .get(idx)
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                shape_names
+                    .iter()
+                    .find(|s| s.to_ascii_lowercase().ends_with(fallback_suffix))
+                    .cloned()
+            })?;
+        Some(BlendShapeBinding {
+            mesh: mesh_name.to_owned(),
+            blendshape: name,
+        })
+    };
+
+    VisemeMap {
+        sil: make_binding(0, "sil"),
+        aa: make_binding(10, "_aa"),
+        ee: make_binding(11, "_ee"),
+        ih: make_binding(12, "_ih"),
+        oh: make_binding(13, "_oh"),
+        ou: make_binding(14, "_ou"),
+    }
 }
 
 /// Parses a `VRCExpressionParameters` `.asset` file.

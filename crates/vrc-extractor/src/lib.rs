@@ -22,8 +22,8 @@ use fbx_loader::{load_fbx_scene, unity_lh_to_gltf_rh_transform, FbxSceneData};
 use indexer::{parse_fbx_meta_human_description, AssetIndex, UnityRef};
 use modular_avatar::apply_modular_avatar;
 use yaml_parser::avatar::{
-    extract_avatar_descriptor_data, extract_physbones_and_colliders, find_avatar_candidates,
-    parse_expression_parameters_asset, parse_expressions_menu_asset,
+    build_viseme_map_for_mesh, extract_avatar_descriptor_data, extract_physbones_and_colliders,
+    find_avatar_candidates, parse_expression_parameters_asset, parse_expressions_menu_asset,
 };
 use yaml_parser::helpers::{yaml_as_virtual_id, yaml_get};
 use yaml_parser::prefab::VirtualId;
@@ -309,12 +309,28 @@ where
         mat_def.params.fur_mask_texture_index = tex_info.fur_mask_texture_index;
     }
 
+    let mut viseme_map = desc_data.viseme_map;
+    if viseme_map.sil.is_none()
+        && viseme_map.aa.is_none()
+        && viseme_map.ee.is_none()
+        && viseme_map.ih.is_none()
+        && viseme_map.oh.is_none()
+        && viseme_map.ou.is_none()
+        && !desc_data.viseme_blend_shapes.is_empty()
+    {
+        if let Some(best_mesh) =
+            find_viseme_mesh_by_blendshapes(&glb_input.meshes, &desc_data.viseme_blend_shapes)
+        {
+            viseme_map = build_viseme_map_for_mesh(&best_mesh.name, &desc_data.viseme_blend_shapes);
+        }
+    }
+
     let manifest = MascotManifest {
         schema_version: SCHEMA_VERSION.to_owned(),
         avatar_name: opts.avatar_name.clone(),
         glb_file: "avatar.glb".to_owned(),
         humanoid_bones,
-        viseme_map: desc_data.viseme_map,
+        viseme_map,
         phys_bones,
         colliders,
         expressions,
@@ -605,17 +621,16 @@ fn build_glb_export_input(
 
         let fbx_mesh = select_fbx_mesh(fbx_scene, &node.name).clone();
 
-        // Resolve materials
-        let mut mat_indices = Vec::new();
+        // Resolve materials (preserving slot alignment for multi-material FBX meshes)
+        let mut mat_indices: Vec<Option<usize>> = Vec::new();
         if let Some(mats_arr) =
             yaml_get(&renderer_comp.data, "m_Materials").and_then(|v| v.as_vec())
         {
             for m_yaml in mats_arr {
-                if let Some(m_ref) = UnityRef::from_yaml(m_yaml) {
-                    if let Some(idx) = resolve_material(&m_ref, warnings) {
-                        mat_indices.push(idx);
-                    }
-                }
+                let resolved = UnityRef::from_yaml(m_yaml)
+                    .filter(|r| !r.is_null())
+                    .and_then(|m_ref| resolve_material(&m_ref, warnings));
+                mat_indices.push(resolved);
             }
         }
 
@@ -788,4 +803,33 @@ fn find_joint_glb_node(
         return Some(idx);
     }
     None
+}
+
+fn find_viseme_mesh_by_blendshapes<'a>(
+    meshes: &'a [GlbMeshAttachment],
+    viseme_shapes: &[String],
+) -> Option<&'a GlbMeshAttachment> {
+    let non_empty: Vec<&str> = viseme_shapes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    meshes
+        .iter()
+        .filter_map(|m| {
+            let hits = non_empty
+                .iter()
+                .filter(|shape| m.fbx_mesh.morph_target_names.iter().any(|mt| mt == *shape))
+                .count();
+            if hits > 0 {
+                Some((hits, m))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(hits, _)| *hits)
+        .map(|(_, m)| m)
 }

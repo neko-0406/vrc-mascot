@@ -31,8 +31,8 @@ pub struct GlbNodeInput {
 pub struct GlbMeshAttachment {
     pub name: String,
     pub fbx_mesh: FbxMeshData,
-    /// Maps FBX primitive `material_slot` -> global glTF material index.
-    pub material_indices: Vec<usize>,
+    /// Maps FBX primitive `material_slot` -> global glTF material index (`None` preserves slot alignment when a slot has no material).
+    pub material_indices: Vec<Option<usize>>,
 }
 
 /// Skinning input linking a glTF mesh node to skeleton joint node indices.
@@ -343,8 +343,8 @@ pub fn export_glb(
             let mat_idx = mesh_att
                 .material_indices
                 .get(prim.material_slot)
-                .copied()
-                .or_else(|| mesh_att.material_indices.first().copied())
+                .and_then(|opt| *opt)
+                .or_else(|| mesh_att.material_indices.iter().flatten().copied().next())
                 .filter(|&m| m < root.materials.len())
                 .map(|m| gjson::Index::new(m as u32));
 

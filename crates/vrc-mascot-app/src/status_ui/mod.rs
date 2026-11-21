@@ -9,7 +9,7 @@ use vrc_schema::{
     ImportJobStatus, MascotState, QualityPreset,
 };
 
-use crate::app_state::{sanitize_avatar_id, AppState};
+use crate::app_state::{sanitize_avatar_id, AppState, FolderPickerTarget};
 
 /// Active tab in the Status & Settings window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -412,11 +412,16 @@ impl StatusUiState {
                         .desired_width(420.0)
                         .hint_text("C:\\Path\\To\\UnityProject"),
                 );
-                if ui.button("フォルダ選択...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        app.import_form.project_dir = folder.display().to_string();
-                        app.discover_scenes_in(folder);
-                    }
+                if ui
+                    .add_enabled(
+                        !app.folder_picker_open,
+                        egui::Button::new("フォルダ選択..."),
+                    )
+                    .clicked()
+                {
+                    let trimmed = app.import_form.project_dir.trim();
+                    let initial = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+                    app.open_folder_picker(FolderPickerTarget::ImportProjectDir, initial);
                 }
                 if ui.button("スキャン").clicked() && !app.import_form.project_dir.trim().is_empty()
                 {
@@ -887,6 +892,8 @@ impl StatusUiState {
                 egui::CollapsingHeader::new("6. アバター・インポート設定 ([avatar_import])")
                     .default_open(true)
                     .show(ui, |ui| {
+                        let mut open_extract_picker: Option<Option<PathBuf>> = None;
+                        let picker_disabled = app.folder_picker_open;
                         let ai = &mut app.draft_config.avatar_import;
                         ui.horizontal(|ui| {
                             ui.label("デフォルトアバター ID:");
@@ -914,10 +921,13 @@ impl StatusUiState {
                                 egui::TextEdit::singleline(&mut ai.extract_output_dir)
                                     .desired_width(340.0),
                             );
-                            if ui.button("選択...").clicked() {
-                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                    ai.extract_output_dir = folder.display().to_string();
-                                }
+                            if ui
+                                .add_enabled(!picker_disabled, egui::Button::new("選択..."))
+                                .clicked()
+                            {
+                                let trimmed = ai.extract_output_dir.trim();
+                                let initial = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+                                open_extract_picker = Some(initial);
                             }
                         });
                         ui.horizontal(|ui| {
@@ -938,6 +948,9 @@ impl StatusUiState {
                                     }
                                 });
                         });
+                        if let Some(initial) = open_extract_picker {
+                            app.open_folder_picker(FolderPickerTarget::ExtractOutputDir, initial);
+                        }
                     });
             });
     }
