@@ -112,6 +112,7 @@ pub struct AssetIndex {
     ma_script_guids: HashMap<String, MaComponentKind>,
     vrc_script_guids: HashMap<String, VrcComponentKind>,
     shader_guids: HashMap<String, ShaderFamily>,
+    shader_headers: HashMap<String, String>,
 }
 
 impl AssetIndex {
@@ -209,6 +210,10 @@ impl AssetIndex {
             }
         } else if lower_name.ends_with(".shader") {
             let shader_header = read_shader_header_name(asset_path);
+            if let Some(ref header) = shader_header {
+                self.shader_headers
+                    .insert(guid.to_owned(), header.to_ascii_lowercase());
+            }
             let combined = format!(
                 "{} {}",
                 lower_name,
@@ -281,6 +286,13 @@ impl AssetIndex {
             }
         }
         None
+    }
+
+    /// Returns the lowercased `Shader "..."` header name for a shader asset GUID if indexed.
+    pub fn shader_header_by_guid(&self, guid: &str) -> Option<&str> {
+        self.shader_headers
+            .get(&guid.trim().to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     /// Resolves a project-relative or absolute path into an absolute path inside `project_dir`.

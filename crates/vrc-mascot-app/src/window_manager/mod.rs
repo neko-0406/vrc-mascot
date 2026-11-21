@@ -141,12 +141,18 @@ impl MascotAppRunner {
         let (init_w, init_h) = self.perch.size();
         let (init_x, init_y) = self.perch.position();
 
-        let avatar_attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut avatar_attrs = Window::default_attributes()
             .with_title("VRC Desktop Mascot")
             .with_decorations(false)
             .with_transparent(true)
             .with_inner_size(LogicalSize::new(init_w as f64, init_h as f64))
             .with_position(PhysicalPosition::new(init_x, init_y));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            avatar_attrs = avatar_attrs.with_no_redirection_bitmap(true);
+        }
         let avatar_window = Arc::new(event_loop.create_window(avatar_attrs)?);
         let avatar_hwnd = win32::hwnd_from_winit(&avatar_window).unwrap_or(0);
         let dpi = avatar_window.scale_factor();

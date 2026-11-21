@@ -30,7 +30,7 @@ impl Default for FrameUniforms {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0, 0.8, 2.5, 0.0],
             light_dir: [0.45, 0.75, 0.55, 1.0],
-            light_color: [1.0, 0.98, 0.96, 0.18],
+            light_color: [0.92, 0.90, 0.88, 0.05],
             audiolink_bands: [0.0; 4],
             audiolink_meta: [0.0; 4],
             head_sphere: [0.0; 4],
@@ -107,8 +107,31 @@ impl Default for MaterialUniforms {
     }
 }
 
+/// Converts an sRGB color channel (or HDR > 1.0 value) into linear light space.
+#[inline]
+pub fn srgb_to_linear_channel(c: f32) -> f32 {
+    if !c.is_finite() || c <= 0.0 {
+        0.0
+    } else if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Converts RGB channels of `[r, g, b, a]` from sRGB to linear while preserving alpha.
+#[inline]
+pub fn srgb_rgba_to_linear(rgba: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_to_linear_channel(rgba[0]),
+        srgb_to_linear_channel(rgba[1]),
+        srgb_to_linear_channel(rgba[2]),
+        rgba[3],
+    ]
+}
+
 impl MaterialUniforms {
-    /// Converts a schema [`MaterialDef`] into GPU-ready uniform values.
+    /// Converts a schema [`MaterialDef`] into GPU-ready linear-space uniform values.
     pub fn from_material_def(mat: &MaterialDef) -> Self {
         let p = &mat.params;
         let family = match mat.shader_family {
@@ -123,13 +146,13 @@ impl MaterialUniforms {
             AlphaMode::Blend => 2.0,
         };
         Self {
-            main_color: p.main_color,
-            shadow_color_1: p.shadow_color_1,
-            shadow_color_2: p.shadow_color_2,
-            rim_color: p.rim_color,
-            matcap_color: p.matcap_color,
-            emission_color: p.emission_color,
-            outline_color: p.outline_color,
+            main_color: srgb_rgba_to_linear(p.main_color),
+            shadow_color_1: srgb_rgba_to_linear(p.shadow_color_1),
+            shadow_color_2: srgb_rgba_to_linear(p.shadow_color_2),
+            rim_color: srgb_rgba_to_linear(p.rim_color),
+            matcap_color: srgb_rgba_to_linear(p.matcap_color),
+            emission_color: srgb_rgba_to_linear(p.emission_color),
+            outline_color: srgb_rgba_to_linear(p.outline_color),
             shadow_params: [
                 p.shadow_border,
                 p.shadow_blur,
@@ -162,5 +185,32 @@ impl MaterialUniforms {
             ],
             mode_flags: [alpha_mode, 0.0, 0.0, 0.0],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vrc_schema::MaterialParams;
+
+    #[test]
+    fn material_uniforms_converts_srgb_colors_to_linear() {
+        let def = MaterialDef {
+            gltf_material_index: 0,
+            name: "Test".to_owned(),
+            shader_family: ShaderFamily::LilToon,
+            render_queue: 2000,
+            alpha_mode: AlphaMode::Opaque,
+            params: MaterialParams {
+                shadow_color_1: [0.5, 0.5, 0.5, 0.8],
+                rim_color: [0.7, 0.8, 0.9, 0.6],
+                ..Default::default()
+            },
+        };
+        let u = MaterialUniforms::from_material_def(&def);
+        assert!((u.shadow_color_1[0] - 0.214).abs() < 0.01);
+        assert_eq!(u.shadow_color_1[3], 0.8);
+        assert!(u.rim_color[0] < 0.5);
+        assert_eq!(u.rim_color[3], 0.6);
     }
 }

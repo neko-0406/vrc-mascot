@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::f32::consts::TAU;
 
-use glam::{EulerRot, Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use vrc_schema::{MascotState, MotionConfig};
 
 use crate::skeleton::SkeletonPose;
@@ -48,12 +48,20 @@ struct HumanoidIndices {
     head: Option<usize>,
     left_eye: Option<usize>,
     right_eye: Option<usize>,
+    left_upper_arm: Option<usize>,
+    right_upper_arm: Option<usize>,
+    left_lower_arm: Option<usize>,
+    right_lower_arm: Option<usize>,
+    left_hand: Option<usize>,
+    right_hand: Option<usize>,
     left_upper_leg: Option<usize>,
     right_upper_leg: Option<usize>,
     left_lower_leg: Option<usize>,
     right_lower_leg: Option<usize>,
-    left_upper_arm: Option<usize>,
-    right_upper_arm: Option<usize>,
+    left_foot: Option<usize>,
+    right_foot: Option<usize>,
+    left_toes: Option<usize>,
+    right_toes: Option<usize>,
 }
 
 /// Deterministic XorShift64 PRNG for natural blink intervals without external randomness deps.
@@ -95,6 +103,12 @@ impl XorShift64 {
 #[derive(Debug, Clone)]
 pub struct AutonomousMotion {
     bones: HumanoidIndices,
+    forward_dir: Vec3,
+    left_dir: Vec3,
+    neck_rest_world_rot: Quat,
+    head_rest_world_rot: Quat,
+    left_eye_rest_world_rot: Quat,
+    right_eye_rest_world_rot: Quat,
     sim_time: f32,
     rng: XorShift64,
     blink_timer: f32,
@@ -133,19 +147,49 @@ impl AutonomousMotion {
             head: resolve("Head"),
             left_eye: resolve("LeftEye"),
             right_eye: resolve("RightEye"),
+            left_upper_arm: resolve("LeftUpperArm"),
+            right_upper_arm: resolve("RightUpperArm"),
+            left_lower_arm: resolve("LeftLowerArm"),
+            right_lower_arm: resolve("RightLowerArm"),
+            left_hand: resolve("LeftHand"),
+            right_hand: resolve("RightHand"),
             left_upper_leg: resolve("LeftUpperLeg"),
             right_upper_leg: resolve("RightUpperLeg"),
             left_lower_leg: resolve("LeftLowerLeg"),
             right_lower_leg: resolve("RightLowerLeg"),
-            left_upper_arm: resolve("LeftUpperArm"),
-            right_upper_arm: resolve("RightUpperArm"),
+            left_foot: resolve("LeftFoot"),
+            right_foot: resolve("RightFoot"),
+            left_toes: resolve("LeftToes"),
+            right_toes: resolve("RightToes"),
         };
+
+        let forward_dir = detect_avatar_forward(&bones, rest_pose);
+        let left_dir = Vec3::Y.cross(forward_dir).normalize_or(Vec3::X);
+
+        let mut rest_world = rest_pose.clone();
+        rest_world.update_world_transforms();
+        let rest_rot_of = |idx_opt: Option<usize>| {
+            idx_opt
+                .and_then(|idx| rest_world.world_rotation(idx))
+                .unwrap_or(Quat::IDENTITY)
+        };
+
+        let neck_rest_world_rot = rest_rot_of(bones.neck);
+        let head_rest_world_rot = rest_rot_of(bones.head);
+        let left_eye_rest_world_rot = rest_rot_of(bones.left_eye);
+        let right_eye_rest_world_rot = rest_rot_of(bones.right_eye);
 
         let mut rng = XorShift64::new(0x5EED_B11C_CAFE_1234);
         let next_blink_interval = rng.range_f32(2.5, 6.0);
 
         Self {
             bones,
+            forward_dir,
+            left_dir,
+            neck_rest_world_rot,
+            head_rest_world_rot,
+            left_eye_rest_world_rot,
+            right_eye_rest_world_rot,
             sim_time: 0.0,
             rng,
             blink_timer: 0.0,
@@ -235,8 +279,17 @@ impl AutonomousMotion {
 
         let mut blendshape_weights = HashMap::new();
         if blink_weight > 0.0 {
-            blendshape_weights.insert("blink".to_owned(), blink_weight);
-            blendshape_weights.insert("Blink".to_owned(), blink_weight);
+            for key in [
+                "vrc.blink",
+                "blink",
+                "Blink",
+                "eye_close",
+                "Eye_Close",
+                "まばたき",
+                "Fcl_EYE_Close",
+            ] {
+                blendshape_weights.insert(key.to_owned(), blink_weight);
+            }
         }
 
         // 5. Head/cheek petting gesture detection
@@ -271,28 +324,39 @@ impl AutonomousMotion {
         let breath_phase = t * TAU * 0.28; // ~3.57s breath cycle
         let breath = breath_phase.sin();
 
-        // Chest / UpperChest subtle pitch
-        let chest_pitch = breath * 0.025; // ~1.4 deg
-        if let Some(idx) = self.bones.chest.or(self.bones.upper_chest) {
-            pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(chest_pitch));
+        pose.update_world_transforms();
+
+        // Hips subtle weight shift in world space
+        if let Some(idx) = self.bones.hips {
+            let shift = self.left_dir * ((t * 0.45).sin() * 0.008) + Vec3::Y * (breath * 0.003);
+            apply_world_translation_offset(pose, idx, shift);
+            apply_world_rotation_offset(
+                pose,
+                idx,
+                Quat::from_axis_angle(self.forward_dir, -(t * 0.45).sin() * 0.01),
+            );
+            pose.update_world_transforms();
         }
 
         // Spine gentle sway & counter-breath
         let spine_yaw = (t * 0.65).sin() * 0.015;
         let spine_roll = (t * 0.45).cos() * 0.012;
         if let Some(idx) = self.bones.spine {
-            pose.apply_local_rotation_offset(
-                idx,
-                Quat::from_euler(EulerRot::YXZ, spine_yaw, breath * 0.012, spine_roll),
-            );
+            let spine_rot = Quat::from_axis_angle(Vec3::Y, spine_yaw)
+                * Quat::from_axis_angle(self.left_dir, breath * 0.012)
+                * Quat::from_axis_angle(self.forward_dir, spine_roll);
+            apply_world_rotation_offset(pose, idx, spine_rot);
+            pose.update_world_transforms();
         }
 
-        // Hips subtle weight shift
-        if let Some(idx) = self.bones.hips {
-            let rest_t = pose.nodes()[idx].rest_translation;
-            let shift = Vec3::new((t * 0.45).sin() * 0.008, breath * 0.003, 0.0);
-            pose.set_local_translation(idx, rest_t + shift);
-            pose.apply_local_rotation_offset(idx, Quat::from_rotation_z(-(t * 0.45).sin() * 0.01));
+        // Chest / UpperChest subtle pitch
+        let chest_pitch = breath * 0.025; // ~1.4 deg
+        if let Some(idx) = self.bones.chest.or(self.bones.upper_chest) {
+            apply_world_rotation_offset(
+                pose,
+                idx,
+                Quat::from_axis_angle(self.left_dir, chest_pitch),
+            );
         }
     }
 
@@ -322,81 +386,172 @@ impl AutonomousMotion {
         self.drag_blend += (drag_target - self.drag_blend) * blend_alpha;
         self.fall_blend += (fall_target - self.fall_blend) * blend_alpha;
 
-        // Sitting pose: bend hips/upper legs forward and lower legs downward.
+        pose.update_world_transforms();
+
+        // Sitting pose: drop hips in world -Y, bend thighs forward and shins down.
         if self.sit_blend > 1e-4 {
             let w = self.sit_blend;
-            let upper_leg_pitch = -78.0f32.to_radians() * w;
-            let lower_leg_pitch = 78.0f32.to_radians() * w;
-            let splay = 6.0f32.to_radians() * w;
-
-            if let Some(idx) = self.bones.left_upper_leg {
-                pose.apply_local_rotation_offset(
-                    idx,
-                    Quat::from_euler(EulerRot::YXZ, 0.0, upper_leg_pitch, splay),
-                );
-            }
-            if let Some(idx) = self.bones.right_upper_leg {
-                pose.apply_local_rotation_offset(
-                    idx,
-                    Quat::from_euler(EulerRot::YXZ, 0.0, upper_leg_pitch, -splay),
-                );
-            }
-            if let Some(idx) = self.bones.left_lower_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(lower_leg_pitch));
-            }
-            if let Some(idx) = self.bones.right_lower_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(lower_leg_pitch));
-            }
             if let Some(idx) = self.bones.hips {
-                let curr_t = pose.local_transforms()[idx].0;
-                pose.set_local_translation(idx, curr_t + Vec3::new(0.0, -0.15 * w, 0.0));
+                apply_world_translation_offset(pose, idx, Vec3::new(0.0, -0.15 * w, 0.0));
+                pose.update_world_transforms();
             }
+
+            let upper_leg_pitch = -80.0f32.to_radians() * w;
+            let lower_leg_pitch = 82.0f32.to_radians() * w;
+            let splay_angle = 6.0f32.to_radians() * w;
+
+            for (upper_opt, fallback_out) in [
+                (self.bones.left_upper_leg, -self.left_dir),
+                (self.bones.right_upper_leg, self.left_dir),
+            ] {
+                if let Some(idx) = upper_opt {
+                    let outward = limb_outward_dir(pose, idx, self.bones.hips, fallback_out);
+                    let splay_axis = Vec3::NEG_Y.cross(outward).normalize_or(self.forward_dir);
+                    let delta = Quat::from_axis_angle(self.left_dir, upper_leg_pitch)
+                        * Quat::from_axis_angle(splay_axis, splay_angle);
+                    apply_world_rotation_offset(pose, idx, delta);
+                }
+            }
+            pose.update_world_transforms();
+
+            for idx in [self.bones.left_lower_leg, self.bones.right_lower_leg]
+                .into_iter()
+                .flatten()
+            {
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, lower_leg_pitch),
+                );
+            }
+            pose.update_world_transforms();
         }
 
-        // Dragged pose: gentle dangling legs and slightly raised arms.
+        // Dragged pose: gentle dangling legs.
         if self.drag_blend > 1e-4 {
             let w = self.drag_blend;
             let dangle = (self.sim_time * 4.5).sin() * 8.0f32.to_radians() * w;
             let knee_bend = 18.0f32.to_radians() * w;
-            let arm_out = 18.0f32.to_radians() * w;
 
             if let Some(idx) = self.bones.left_upper_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(dangle));
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, dangle),
+                );
             }
             if let Some(idx) = self.bones.right_upper_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(-dangle));
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, -dangle),
+                );
             }
-            if let Some(idx) = self.bones.left_lower_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(knee_bend));
+            pose.update_world_transforms();
+
+            for idx in [self.bones.left_lower_leg, self.bones.right_lower_leg]
+                .into_iter()
+                .flatten()
+            {
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, knee_bend),
+                );
             }
-            if let Some(idx) = self.bones.right_lower_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(knee_bend));
-            }
-            if let Some(idx) = self.bones.left_upper_arm {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_z(arm_out));
-            }
-            if let Some(idx) = self.bones.right_upper_arm {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_z(-arm_out));
-            }
+            pose.update_world_transforms();
         }
 
-        // Falling pose: arms raised wider and gentle leg flail.
+        // Falling pose: gentle leg flail.
         if self.fall_blend > 1e-4 {
             let w = self.fall_blend;
-            let arm_raise = 38.0f32.to_radians() * w;
             let leg_flail = (self.sim_time * 9.0).sin() * 12.0f32.to_radians() * w;
 
-            if let Some(idx) = self.bones.left_upper_arm {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_z(arm_raise));
-            }
-            if let Some(idx) = self.bones.right_upper_arm {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_z(-arm_raise));
-            }
             if let Some(idx) = self.bones.left_upper_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(leg_flail));
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, leg_flail),
+                );
             }
             if let Some(idx) = self.bones.right_upper_leg {
-                pose.apply_local_rotation_offset(idx, Quat::from_rotation_x(-leg_flail));
+                apply_world_rotation_offset(
+                    pose,
+                    idx,
+                    Quat::from_axis_angle(self.left_dir, -leg_flail),
+                );
+            }
+            pose.update_world_transforms();
+        }
+
+        // Arm relaxation & posture-driven arm targets (eliminates T-pose across all states).
+        let total_state = self.sit_blend + self.drag_blend + self.fall_blend;
+        let idle_w = (1.0 - total_state).max(0.0);
+        let norm = (idle_w + total_state).max(1e-5);
+        let breath_sway = (self.sim_time * TAU * 0.28).sin() * 0.015;
+
+        let arms = [
+            (
+                self.bones.left_upper_arm,
+                self.bones.left_lower_arm,
+                self.bones.left_hand,
+                -self.left_dir,
+            ),
+            (
+                self.bones.right_upper_arm,
+                self.bones.right_lower_arm,
+                self.bones.right_hand,
+                self.left_dir,
+            ),
+        ];
+
+        for (upper_opt, lower_opt, hand_opt, fallback_out) in arms {
+            let Some(upper_idx) = upper_opt else {
+                continue;
+            };
+            let Some(upper_child_idx) = lower_opt.or(hand_opt) else {
+                continue;
+            };
+            let arm_out = limb_outward_dir(pose, upper_idx, self.bones.chest, fallback_out);
+
+            let idle_upper_dir =
+                (Vec3::NEG_Y * 0.94 + arm_out * (0.28 + breath_sway) + self.forward_dir * 0.12)
+                    .normalize();
+            let sit_upper_dir =
+                (Vec3::NEG_Y * 0.85 + arm_out * 0.30 + self.forward_dir * 0.35).normalize();
+            let drag_upper_dir =
+                (Vec3::NEG_Y * 0.72 + arm_out * 0.65 + self.forward_dir * 0.15).normalize();
+            let fall_upper_dir =
+                (Vec3::Y * 0.45 + arm_out * 0.85 + self.forward_dir * 0.25).normalize();
+
+            let target_upper_dir = ((idle_upper_dir * idle_w
+                + sit_upper_dir * self.sit_blend
+                + drag_upper_dir * self.drag_blend
+                + fall_upper_dir * self.fall_blend)
+                / norm)
+                .normalize_or(idle_upper_dir);
+
+            swing_limb_to_world_dir(pose, upper_idx, upper_child_idx, target_upper_dir, 1.0);
+            pose.update_world_transforms();
+
+            if let (Some(lower_idx), Some(hand_idx)) = (lower_opt, hand_opt) {
+                let idle_lower_dir =
+                    (target_upper_dir + self.forward_dir * 0.22 + Vec3::NEG_Y * 0.08).normalize();
+                let sit_lower_dir =
+                    (Vec3::NEG_Y * 0.55 + self.forward_dir * 0.80 - arm_out * 0.25).normalize();
+                let drag_lower_dir = (target_upper_dir + self.forward_dir * 0.35).normalize();
+                let fall_lower_dir =
+                    (Vec3::Y * 0.65 + arm_out * 0.55 + self.forward_dir * 0.45).normalize();
+
+                let target_lower_dir = ((idle_lower_dir * idle_w
+                    + sit_lower_dir * self.sit_blend
+                    + drag_lower_dir * self.drag_blend
+                    + fall_lower_dir * self.fall_blend)
+                    / norm)
+                    .normalize_or(idle_lower_dir);
+
+                swing_limb_to_world_dir(pose, lower_idx, hand_idx, target_lower_dir, 1.0);
+                pose.update_world_transforms();
             }
         }
     }
@@ -417,29 +572,41 @@ impl AutonomousMotion {
         let gx = self.smoothed_gaze.x.clamp(-1.0, 1.0);
         let gy = self.smoothed_gaze.y.clamp(-1.0, 1.0);
 
+        let apply_gaze_rot =
+            |pose: &mut SkeletonPose, idx: usize, rest_world_rot: Quat, delta_world: Quat| {
+                let local_delta =
+                    (rest_world_rot.inverse() * delta_world * rest_world_rot).normalize();
+                pose.apply_local_rotation_offset(idx, local_delta);
+            };
+
         // Neck (~10 deg yaw, ~7 deg pitch)
         if let Some(idx) = self.bones.neck {
             let yaw = gx * 10.0f32.to_radians();
             let pitch = -gy * 7.0f32.to_radians();
-            pose.apply_local_rotation_offset(idx, Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0));
+            let rot =
+                Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(self.left_dir, pitch);
+            apply_gaze_rot(pose, idx, self.neck_rest_world_rot, rot);
         }
 
         // Head (~25 deg yaw, ~18 deg pitch)
         if let Some(idx) = self.bones.head {
             let yaw = gx * 25.0f32.to_radians();
             let pitch = -gy * 18.0f32.to_radians();
-            pose.apply_local_rotation_offset(idx, Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0));
+            let rot =
+                Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(self.left_dir, pitch);
+            apply_gaze_rot(pose, idx, self.head_rest_world_rot, rot);
         }
 
         // Eyes (~15 deg yaw, ~10 deg pitch)
         let eye_yaw = gx * 15.0f32.to_radians();
         let eye_pitch = -gy * 10.0f32.to_radians();
-        let eye_rot = Quat::from_euler(EulerRot::YXZ, eye_yaw, eye_pitch, 0.0);
+        let eye_rot = Quat::from_axis_angle(Vec3::Y, eye_yaw)
+            * Quat::from_axis_angle(self.left_dir, eye_pitch);
         if let Some(idx) = self.bones.left_eye {
-            pose.apply_local_rotation_offset(idx, eye_rot);
+            apply_gaze_rot(pose, idx, self.left_eye_rest_world_rot, eye_rot);
         }
         if let Some(idx) = self.bones.right_eye {
-            pose.apply_local_rotation_offset(idx, eye_rot);
+            apply_gaze_rot(pose, idx, self.right_eye_rest_world_rot, eye_rot);
         }
     }
 
@@ -532,10 +699,114 @@ impl AutonomousMotion {
     }
 }
 
+fn detect_avatar_forward(bones: &HumanoidIndices, rest_pose: &SkeletonPose) -> Vec3 {
+    let mut pose = rest_pose.clone();
+    pose.update_world_transforms();
+
+    if let Some(head_pos) = bones.head.and_then(|idx| pose.world_position(idx)) {
+        let mut eye_dir = Vec3::ZERO;
+        let mut count = 0;
+        for eye_opt in [bones.left_eye, bones.right_eye] {
+            if let Some(eye_pos) = eye_opt.and_then(|idx| pose.world_position(idx)) {
+                eye_dir += (eye_pos - head_pos).with_y(0.0);
+                count += 1;
+            }
+        }
+        if count == 2 && eye_dir.length_squared() > 1e-6 {
+            return eye_dir.normalize();
+        }
+        if count == 1 && eye_dir.length_squared() > 1e-6 {
+            return if eye_dir.z.abs() >= eye_dir.x.abs() {
+                Vec3::new(0.0, 0.0, eye_dir.z.signum())
+            } else {
+                Vec3::new(eye_dir.x.signum(), 0.0, 0.0)
+            };
+        }
+    }
+
+    let mut foot_dir = Vec3::ZERO;
+    for (toes_opt, foot_opt) in [
+        (bones.left_toes, bones.left_foot),
+        (bones.right_toes, bones.right_foot),
+    ] {
+        if let (Some(toes_pos), Some(foot_pos)) = (
+            toes_opt.and_then(|idx| pose.world_position(idx)),
+            foot_opt.and_then(|idx| pose.world_position(idx)),
+        ) {
+            foot_dir += (toes_pos - foot_pos).with_y(0.0);
+        }
+    }
+    if foot_dir.length_squared() > 1e-6 {
+        return foot_dir.normalize();
+    }
+
+    Vec3::Z
+}
+
+fn apply_world_rotation_offset(pose: &mut SkeletonPose, idx: usize, delta_world: Quat) {
+    let Some(world_rot) = pose.world_rotation(idx) else {
+        return;
+    };
+    let local_delta = (world_rot.inverse() * delta_world * world_rot).normalize();
+    pose.apply_local_rotation_offset(idx, local_delta);
+}
+
+fn apply_world_translation_offset(pose: &mut SkeletonPose, idx: usize, delta_world: Vec3) {
+    let parent_world = pose
+        .nodes()
+        .get(idx)
+        .and_then(|n| n.parent)
+        .and_then(|p| pose.world_matrix(p))
+        .unwrap_or(Mat4::IDENTITY);
+    let local_delta = parent_world.inverse().transform_vector3(delta_world);
+    let curr = pose.local_transforms()[idx].0;
+    pose.set_local_translation(idx, curr + local_delta);
+}
+
+fn swing_limb_to_world_dir(
+    pose: &mut SkeletonPose,
+    parent_idx: usize,
+    child_idx: usize,
+    desired_world_dir: Vec3,
+    weight: f32,
+) {
+    let (Some(p_pos), Some(c_pos)) = (
+        pose.world_position(parent_idx),
+        pose.world_position(child_idx),
+    ) else {
+        return;
+    };
+    let curr_dir = (c_pos - p_pos).normalize_or_zero();
+    let target_dir = desired_world_dir.normalize_or_zero();
+    if curr_dir.length_squared() < 1e-6 || target_dir.length_squared() < 1e-6 {
+        return;
+    }
+    let full_delta = Quat::from_rotation_arc(curr_dir, target_dir);
+    let delta_world = Quat::IDENTITY.slerp(full_delta, weight.clamp(0.0, 1.0));
+    apply_world_rotation_offset(pose, parent_idx, delta_world);
+}
+
+fn limb_outward_dir(
+    pose: &SkeletonPose,
+    limb_idx: usize,
+    center_idx_opt: Option<usize>,
+    fallback: Vec3,
+) -> Vec3 {
+    let Some(limb_pos) = pose.world_position(limb_idx) else {
+        return fallback.with_y(0.0).normalize_or(Vec3::X);
+    };
+    let center_pos = center_idx_opt
+        .and_then(|c| pose.world_position(c))
+        .unwrap_or(Vec3::ZERO);
+    let horiz = (limb_pos - center_pos).with_y(0.0);
+    horiz.normalize_or(fallback.with_y(0.0).normalize_or(Vec3::X))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skeleton::SkeletonNode;
+    use glam::EulerRot;
 
     fn make_humanoid_pose() -> (BTreeMap<String, String>, SkeletonPose) {
         let nodes = vec![
@@ -764,5 +1035,249 @@ mod tests {
             motion.step(0.25, &mut pose, &idle_input, &cfg);
         }
         assert_eq!(motion.pet_count_recent(), 0);
+    }
+
+    #[test]
+    fn rotated_blender_rig_relaxes_arms_sits_and_emits_blink_aliases() {
+        use std::f32::consts::{FRAC_PI_2, PI};
+
+        let nodes = vec![
+            // 0: Armature (-90 deg X)
+            SkeletonNode::new(
+                "Armature",
+                None,
+                vec![1],
+                Vec3::ZERO,
+                Quat::from_rotation_x(-FRAC_PI_2),
+                Vec3::ONE,
+            ),
+            // 1: Hips (+90 deg X -> world identity)
+            SkeletonNode::new(
+                "Hips",
+                Some(0),
+                vec![2, 14, 16],
+                Vec3::new(0.0, 0.0, 0.7),
+                Quat::from_rotation_x(FRAC_PI_2),
+                Vec3::ONE,
+            ),
+            // 2: Spine
+            SkeletonNode::new(
+                "Spine",
+                Some(1),
+                vec![3],
+                Vec3::new(0.0, 0.1, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 3: Chest
+            SkeletonNode::new(
+                "Chest",
+                Some(2),
+                vec![4, 6, 10],
+                Vec3::new(0.0, 0.15, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 4: Head
+            SkeletonNode::new(
+                "Head",
+                Some(3),
+                vec![5],
+                Vec3::new(0.0, 0.2, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 5: LeftEye
+            SkeletonNode::new(
+                "LeftEye",
+                Some(4),
+                vec![],
+                Vec3::new(0.03, 0.05, 0.08),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 6: Shoulder.L (local +Y -> world +X)
+            SkeletonNode::new(
+                "Shoulder.L",
+                Some(3),
+                vec![7],
+                Vec3::new(0.05, 0.12, 0.0),
+                Quat::from_xyzw(-0.5, -0.5, -0.5, 0.5),
+                Vec3::ONE,
+            ),
+            // 7: Upper_Arm.L
+            SkeletonNode::new(
+                "Upper_Arm.L",
+                Some(6),
+                vec![8],
+                Vec3::new(0.0, 0.08, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 8: Lower_Arm.L
+            SkeletonNode::new(
+                "Lower_Arm.L",
+                Some(7),
+                vec![9],
+                Vec3::new(0.0, 0.2, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 9: Hand.L
+            SkeletonNode::new(
+                "Hand.L",
+                Some(8),
+                vec![],
+                Vec3::new(0.0, 0.18, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 10: Shoulder.R (local +Y -> world -X)
+            SkeletonNode::new(
+                "Shoulder.R",
+                Some(3),
+                vec![11],
+                Vec3::new(-0.05, 0.12, 0.0),
+                Quat::from_xyzw(0.5, -0.5, 0.5, 0.5),
+                Vec3::ONE,
+            ),
+            // 11: Upper_Arm.R
+            SkeletonNode::new(
+                "Upper_Arm.R",
+                Some(10),
+                vec![12],
+                Vec3::new(0.0, 0.08, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 12: Lower_Arm.R
+            SkeletonNode::new(
+                "Lower_Arm.R",
+                Some(11),
+                vec![13],
+                Vec3::new(0.0, 0.2, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 13: Hand.R
+            SkeletonNode::new(
+                "Hand.R",
+                Some(12),
+                vec![],
+                Vec3::new(0.0, 0.18, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 14: Upper_Leg.L (180 deg X -> local +Y points world -Y)
+            SkeletonNode::new(
+                "Upper_Leg.L",
+                Some(1),
+                vec![15],
+                Vec3::new(0.08, -0.05, 0.0),
+                Quat::from_rotation_x(PI),
+                Vec3::ONE,
+            ),
+            // 15: Lower_Leg.L
+            SkeletonNode::new(
+                "Lower_Leg.L",
+                Some(14),
+                vec![],
+                Vec3::new(0.0, 0.3, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+            // 16: Upper_Leg.R
+            SkeletonNode::new(
+                "Upper_Leg.R",
+                Some(1),
+                vec![17],
+                Vec3::new(-0.08, -0.05, 0.0),
+                Quat::from_rotation_x(PI),
+                Vec3::ONE,
+            ),
+            // 17: Lower_Leg.R
+            SkeletonNode::new(
+                "Lower_Leg.R",
+                Some(16),
+                vec![],
+                Vec3::new(0.0, 0.3, 0.0),
+                Quat::IDENTITY,
+                Vec3::ONE,
+            ),
+        ];
+
+        let mut map = BTreeMap::new();
+        for (k, v) in [
+            ("Hips", "Hips"),
+            ("Spine", "Spine"),
+            ("Chest", "Chest"),
+            ("Head", "Head"),
+            ("LeftEye", "LeftEye"),
+            ("LeftShoulder", "Shoulder.L"),
+            ("LeftUpperArm", "Upper_Arm.L"),
+            ("LeftLowerArm", "Lower_Arm.L"),
+            ("LeftHand", "Hand.L"),
+            ("RightShoulder", "Shoulder.R"),
+            ("RightUpperArm", "Upper_Arm.R"),
+            ("RightLowerArm", "Lower_Arm.R"),
+            ("RightHand", "Hand.R"),
+            ("LeftUpperLeg", "Upper_Leg.L"),
+            ("LeftLowerLeg", "Lower_Leg.L"),
+            ("RightUpperLeg", "Upper_Leg.R"),
+            ("RightLowerLeg", "Lower_Leg.R"),
+        ] {
+            map.insert(k.to_string(), v.to_string());
+        }
+
+        let mut pose = SkeletonPose::from_nodes(nodes);
+        let mut motion = AutonomousMotion::new(&map, &pose);
+        let cfg = MotionConfig::default();
+
+        // Idle step: arms must drop well below shoulder height (not horizontal T-pose),
+        // and blinking emits both standard and Japanese/VRM blendshape aliases.
+        let mut saw_blink_aliases = false;
+        for step_idx in 0..(7 * 60) {
+            pose.reset_to_rest();
+            let out = motion.step(1.0 / 60.0, &mut pose, &MotionInput::default(), &cfg);
+            if step_idx == 0 {
+                pose.update_world_transforms();
+                let upper_arm_y = pose.world_position(7).unwrap().y;
+                let lower_arm_y = pose.world_position(8).unwrap().y;
+                let hand_y = pose.world_position(9).unwrap().y;
+                assert!(
+                    lower_arm_y < upper_arm_y - 0.12 && hand_y < lower_arm_y - 0.10,
+                    "idle arms stayed in T-pose: upper={upper_arm_y}, lower={lower_arm_y}, hand={hand_y}"
+                );
+            }
+            if out.blink_weight > 0.0 {
+                assert!(out.blendshape_weights.contains_key("vrc.blink"));
+                assert!(out.blendshape_weights.contains_key("まばたき"));
+                saw_blink_aliases = true;
+                break;
+            }
+        }
+        assert!(saw_blink_aliases, "expected blink within 7s on rotated rig");
+
+        // Seated step: hips drop in world -Y, thigh points forward (+Z), shin drops in -Y.
+        let sit_input = MotionInput {
+            mascot_state: MascotState::SeatedOnTaskbar,
+            ..Default::default()
+        };
+        for _ in 0..90 {
+            pose.reset_to_rest();
+            motion.step(1.0 / 60.0, &mut pose, &sit_input, &cfg);
+        }
+        pose.update_world_transforms();
+        let hips_y = pose.world_position(1).unwrap().y;
+        let thigh_pos = pose.world_position(14).unwrap();
+        let knee_pos = pose.world_position(15).unwrap();
+        assert!(
+            hips_y < 0.60,
+            "expected hips to drop in world -Y, got {hips_y}"
+        );
+        assert!(
+            knee_pos.z > thigh_pos.z + 0.15,
+            "expected thigh to extend forward (+Z): thigh={thigh_pos:?}, knee={knee_pos:?}"
+        );
     }
 }
