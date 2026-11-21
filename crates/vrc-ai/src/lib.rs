@@ -4,8 +4,10 @@ pub mod audio_player;
 pub mod decisions;
 pub mod dialogue;
 pub mod error;
+pub mod fallback;
 mod gemini;
 pub mod lipsync;
+mod openai;
 pub mod privacy;
 #[cfg(test)]
 mod test_support;
@@ -15,6 +17,7 @@ pub use audio_player::SpeechPlayer;
 pub use decisions::DecisionsClient;
 pub use dialogue::{parse_dialogue_response, parse_emotion_tag, DialogueClient, DialogueResponse};
 pub use error::AiError;
+pub use fallback::local_fallback_decision;
 pub use lipsync::{vowel_to_viseme, LipSyncSegment, LipSyncTimeline};
 pub use privacy::{categorize_process, is_excluded_app, sanitize_decision_context};
 pub use voicevox::{

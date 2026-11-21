@@ -48,20 +48,35 @@ pub(crate) fn build_generate_content_url(
     model: &str,
     source_name: &str,
 ) -> Result<String, AiError> {
-    let base = endpoint.trim().trim_end_matches('/');
-    let base = if base.is_empty() {
-        DEFAULT_GEMINI_ENDPOINT
-    } else {
-        base
-    };
-    let model = model.trim();
-    if model.is_empty() {
+    let mut base = endpoint.trim().trim_end_matches('/');
+    if base.is_empty() {
+        base = DEFAULT_GEMINI_ENDPOINT;
+    }
+
+    if base.ends_with(":generateContent") {
+        return Ok(base.to_owned());
+    }
+
+    for suffix in ["/v1beta/decisions", "/v1beta/models", "/v1beta"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped.trim_end_matches('/');
+            break;
+        }
+    }
+    if base.is_empty() {
+        base = DEFAULT_GEMINI_ENDPOINT;
+    }
+
+    let clean_model = model.trim().trim_start_matches("models/");
+    if clean_model.is_empty() {
         return Err(AiError::InvalidResponse {
             source_name: source_name.to_owned(),
             reason: "model name must not be empty".to_owned(),
         });
     }
-    Ok(format!("{base}/v1beta/models/{model}:generateContent"))
+    Ok(format!(
+        "{base}/v1beta/models/{clean_model}:generateContent"
+    ))
 }
 
 pub(crate) async fn post_generate_content(
@@ -154,5 +169,50 @@ pub(crate) fn strip_markdown_code_fence(raw: &str) -> &str {
         before_close.trim()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_generate_content_url_normalizes_legacy_and_full_endpoints() {
+        assert_eq!(
+            build_generate_content_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-flash",
+                "t"
+            )
+            .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            build_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta/decisions/",
+                "models/gemini-2.5-flash-lite",
+                "t"
+            )
+            .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+        );
+        assert_eq!(
+            build_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-2.0-flash",
+                "t"
+            )
+            .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+        assert_eq!(
+            build_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta/models/custom:generateContent",
+                "ignored",
+                "t"
+            )
+            .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/custom:generateContent"
+        );
     }
 }

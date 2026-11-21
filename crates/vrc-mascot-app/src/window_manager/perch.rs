@@ -76,6 +76,7 @@ pub struct PerchController {
     prev_drag_vy: f32,
     drag_offset_x: i32,
     drag_offset_y: i32,
+    last_reported_pos: (i32, i32),
     glide_goal: Option<GlideGoal>,
     pending_impulse: Vec3,
 }
@@ -103,6 +104,7 @@ impl PerchController {
             prev_drag_vy: 0.0,
             drag_offset_x: 0,
             drag_offset_y: 0,
+            last_reported_pos: (init_x, init_y),
             glide_goal: None,
             pending_impulse: Vec3::ZERO,
         }
@@ -322,7 +324,6 @@ impl PerchController {
 
     /// Advances the perch state machine by `dt` seconds and returns updated geometry & impulse.
     pub fn step(&mut self, input: &PerchStepInput<'_>) -> PerchStepOutput {
-        let prev_pos = self.position();
         let prev_size = self.size();
 
         if (sanitize_scale(input.scale) - self.scale).abs() > 1e-4 {
@@ -464,7 +465,7 @@ impl PerchController {
                         } else {
                             MascotState::Idle
                         };
-                        return self.finish_step(prev_pos, prev_size, frame_accel, input.work_area);
+                        return self.finish_step(prev_size, frame_accel, input.work_area);
                     };
 
                     let desired_x = target_rect.left + self.seated_rel_x;
@@ -518,12 +519,11 @@ impl PerchController {
             }
         }
 
-        self.finish_step(prev_pos, prev_size, frame_accel, input.work_area)
+        self.finish_step(prev_size, frame_accel, input.work_area)
     }
 
     fn finish_step(
         &mut self,
-        prev_pos: (i32, i32),
         prev_size: (u32, u32),
         window_accel: Vec3,
         work_area: ScreenRect,
@@ -541,13 +541,15 @@ impl PerchController {
 
         let position = self.position();
         let size = self.size();
+        let position_changed = position != self.last_reported_pos;
+        self.last_reported_pos = position;
         PerchStepOutput {
             position,
             size,
             state: self.state,
             seated_hwnd: self.seated_hwnd,
             window_accel,
-            position_changed: position != prev_pos,
+            position_changed,
             size_changed: size != prev_size,
         }
     }
@@ -904,5 +906,56 @@ mod tests {
             }
         }
         assert_eq!(perch.state(), MascotState::SeatedOnTaskbar);
+    }
+
+    #[test]
+    fn drag_emits_position_changed_every_frame_and_drops_without_warp() {
+        let wa = work_area_1080p();
+        let tb = taskbar_1080p();
+        let cfg = MotionConfig {
+            gravity_enabled: false,
+            ..Default::default()
+        };
+        let mut perch = PerchController::new(wa, 1.0);
+        let start_pos = perch.position();
+
+        perch.begin_drag((1700, 700));
+        for step_idx in 1..=5 {
+            let cursor = (1700 - step_idx * 40, 700 - step_idx * 30);
+            let _ = perch.update_drag(cursor, 1.0 / 60.0, wa);
+            let out = perch.step(&PerchStepInput {
+                dt: 1.0 / 60.0,
+                work_area: wa,
+                taskbar_rect: Some(tb),
+                visible_windows: &[],
+                target_window_rect: None,
+                motion_cfg: &cfg,
+                scale: 1.0,
+            });
+            assert_eq!(out.state, MascotState::Dragged);
+            assert!(
+                out.position_changed,
+                "expected position_changed=true on drag frame {step_idx}"
+            );
+            assert_eq!(
+                out.position,
+                (start_pos.0 - step_idx * 40, start_pos.1 - step_idx * 30)
+            );
+        }
+
+        let dropped_pos = perch.position();
+        perch.end_drag(false);
+        let after_drop = perch.step(&PerchStepInput {
+            dt: 1.0 / 60.0,
+            work_area: wa,
+            taskbar_rect: Some(tb),
+            visible_windows: &[],
+            target_window_rect: None,
+            motion_cfg: &cfg,
+            scale: 1.0,
+        });
+        assert_eq!(after_drop.state, MascotState::Idle);
+        assert_eq!(after_drop.position, dropped_pos);
+        assert!(!after_drop.position_changed);
     }
 }

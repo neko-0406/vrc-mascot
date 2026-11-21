@@ -679,11 +679,56 @@ impl StatusUiState {
                             .spacing([12.0, 6.0])
                             .show(ui, |ui| {
                                 ui.label("対話プロバイダ:");
-                                ui.text_edit_singleline(&mut ai.chat_provider);
+                                egui::ComboBox::from_id_salt("chat_provider_combo")
+                                    .selected_text(format_ai_provider_label(&ai.chat_provider))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut ai.chat_provider,
+                                            "gemini".to_owned(),
+                                            "gemini (Google Gemini)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut ai.chat_provider,
+                                            "openai_compatible".to_owned(),
+                                            "openai_compatible (OpenAI / Ollama / LM Studio)",
+                                        );
+                                    });
+                                ui.end_row();
+
+                                ui.label("対話エンドポイント:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ai.chat_endpoint)
+                                        .desired_width(340.0),
+                                );
                                 ui.end_row();
 
                                 ui.label("対話モデル:");
-                                ui.text_edit_singleline(&mut ai.chat_model);
+                                ui.vertical(|ui| {
+                                    ui.text_edit_singleline(&mut ai.chat_model);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.small_button("gemini-2.5-flash").clicked() {
+                                            ai.chat_provider = "gemini".to_owned();
+                                            ai.chat_endpoint =
+                                                "https://generativelanguage.googleapis.com"
+                                                    .to_owned();
+                                            ai.chat_model = "gemini-2.5-flash".to_owned();
+                                        }
+                                        if ui.small_button("gpt-4o-mini").clicked() {
+                                            ai.chat_provider = "openai_compatible".to_owned();
+                                            ai.chat_endpoint = "https://api.openai.com".to_owned();
+                                            ai.chat_model = "gpt-4o-mini".to_owned();
+                                        }
+                                        if ui.small_button("Ollama (localhost:11434)").clicked() {
+                                            ai.chat_provider = "openai_compatible".to_owned();
+                                            ai.chat_endpoint = "http://127.0.0.1:11434".to_owned();
+                                            if ai.chat_model.trim().is_empty()
+                                                || ai.chat_model.starts_with("gemini-")
+                                            {
+                                                ai.chat_model = "llama3.2".to_owned();
+                                            }
+                                        }
+                                    });
+                                });
                                 ui.end_row();
 
                                 ui.label("対話 API Key:");
@@ -694,11 +739,34 @@ impl StatusUiState {
                                             .desired_width(280.0),
                                     );
                                     ui.checkbox(&mut self.reveal_chat_api_key, "表示");
+                                    ui.weak("(ローカルLLMは空欄可)");
                                 });
                                 ui.end_row();
 
                                 ui.label("行動判断AI (Decisions):");
-                                ui.checkbox(&mut ai.decisions_enabled, "有効にする");
+                                ui.checkbox(&mut ai.decisions_enabled, "リモート判断を有効にする");
+                                ui.end_row();
+
+                                ui.label("Decisions プロバイダ:");
+                                egui::ComboBox::from_id_salt("decisions_provider_combo")
+                                    .selected_text(format_ai_provider_label(&ai.decisions_provider))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut ai.decisions_provider,
+                                            "gemini".to_owned(),
+                                            "gemini (Google Gemini)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut ai.decisions_provider,
+                                            "openai_compatible".to_owned(),
+                                            "openai_compatible (OpenAI / Ollama / LM Studio)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut ai.decisions_provider,
+                                            "local".to_owned(),
+                                            "local (ローカル自律のみ / API不要)",
+                                        );
+                                    });
                                 ui.end_row();
 
                                 ui.label("Decisions エンドポイント:");
@@ -709,7 +777,41 @@ impl StatusUiState {
                                 ui.end_row();
 
                                 ui.label("Decisions モデル:");
-                                ui.text_edit_singleline(&mut ai.decisions_model);
+                                ui.vertical(|ui| {
+                                    ui.text_edit_singleline(&mut ai.decisions_model);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.small_button("gemini-2.5-flash-lite").clicked() {
+                                            ai.decisions_provider = "gemini".to_owned();
+                                            ai.decisions_endpoint =
+                                                "https://generativelanguage.googleapis.com"
+                                                    .to_owned();
+                                            ai.decisions_model = "gemini-2.5-flash-lite".to_owned();
+                                        }
+                                        if ui.small_button("gemini-2.0-flash").clicked() {
+                                            ai.decisions_provider = "gemini".to_owned();
+                                            ai.decisions_endpoint =
+                                                "https://generativelanguage.googleapis.com"
+                                                    .to_owned();
+                                            ai.decisions_model = "gemini-2.0-flash".to_owned();
+                                        }
+                                        if ui.small_button("gpt-4o-mini").clicked() {
+                                            ai.decisions_provider = "openai_compatible".to_owned();
+                                            ai.decisions_endpoint =
+                                                "https://api.openai.com".to_owned();
+                                            ai.decisions_model = "gpt-4o-mini".to_owned();
+                                        }
+                                        if ui.small_button("Ollama (localhost:11434)").clicked() {
+                                            ai.decisions_provider = "openai_compatible".to_owned();
+                                            ai.decisions_endpoint =
+                                                "http://127.0.0.1:11434".to_owned();
+                                            if ai.decisions_model.trim().is_empty()
+                                                || ai.decisions_model.starts_with("gemini-")
+                                            {
+                                                ai.decisions_model = "llama3.2".to_owned();
+                                            }
+                                        }
+                                    });
+                                });
                                 ui.end_row();
 
                                 ui.label("Decisions API Key:");
@@ -720,6 +822,7 @@ impl StatusUiState {
                                             .desired_width(280.0),
                                     );
                                     ui.checkbox(&mut self.reveal_decisions_api_key, "表示");
+                                    ui.weak("(空欄時は対話Keyを使用)");
                                 });
                                 ui.end_row();
 
@@ -1004,6 +1107,15 @@ fn draw_expression_menu_items(ui: &mut egui::Ui, items: &[ExpressionMenuItem], a
                 }
             }
         }
+    }
+}
+
+fn format_ai_provider_label(provider: &str) -> &str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" | "" => "gemini (Google Gemini)",
+        "openai_compatible" | "openai" => "openai_compatible (OpenAI / Local LLM)",
+        "local" => "local (ローカル自律のみ)",
+        _ => provider,
     }
 }
 
