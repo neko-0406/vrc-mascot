@@ -184,7 +184,7 @@ impl StatusUiState {
                 ui.horizontal(|ui| {
                     ui.heading("対話チャット");
                     if ui.small_button("履歴クリア").clicked() {
-                        app.chat_history.clear();
+                        app.clear_chat_history();
                     }
                 });
                 ui.separator();

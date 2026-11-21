@@ -26,6 +26,7 @@ use crate::window_manager::win32;
 pub enum AppCommand {
     RunDecision(DecisionContext),
     SendChat(String),
+    ClearChatHistory,
     CheckVoicevox,
     DiscoverScenes(PathBuf),
     DiscoverAvatars {
@@ -66,6 +67,7 @@ pub enum AppEvent {
         voice_error: Option<String>,
     },
     ChatError(String),
+    ChatHistoryCleared,
     VoicevoxStatus {
         online: bool,
         version: Option<String>,
@@ -308,6 +310,12 @@ impl AppState {
         prune_chat_history(&mut self.chat_history, self.config.ai.max_history_turns);
         self.chat_in_flight = true;
         let _ = self.cmd_tx.send(AppCommand::SendChat(trimmed));
+    }
+
+    /// Clears both the UI chat log and the worker's [`vrc_ai::DialogueClient`] history.
+    pub fn clear_chat_history(&mut self) {
+        self.chat_history.clear();
+        let _ = self.cmd_tx.send(AppCommand::ClearChatHistory);
     }
 
     /// Requests a VOICEVOX Engine health & speaker list check.
@@ -562,6 +570,10 @@ impl AppState {
                 self.chat_in_flight = false;
                 self.status_notice = Some(format!("チャットエラー: {err}"));
             }
+            AppEvent::ChatHistoryCleared => {
+                // UI history was already cleared synchronously when dispatching ClearChatHistory;
+                // do not clear again in case a newer chat turn was queued right after.
+            }
             AppEvent::VoicevoxStatus {
                 online,
                 version,
@@ -795,6 +807,10 @@ async fn run_background_worker(
                     let _ = event_tx.send(AppEvent::ChatError(err.to_string()));
                 }
             },
+            AppCommand::ClearChatHistory => {
+                service.clear_history();
+                let _ = event_tx.send(AppEvent::ChatHistoryCleared);
+            }
             AppCommand::DiscoverScenes(project_dir) => {
                 let res = tokio::task::spawn_blocking(move || {
                     discover_scenes(&project_dir).map_err(|e| e.to_string())
@@ -1020,9 +1036,49 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut raw = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 2048];
+        let mut header_end: Option<usize> = None;
+        let mut content_length: usize = 0;
+
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+            if header_end.is_none() {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let hdr_str = String::from_utf8_lossy(&raw[..end]);
+                    for line in hdr_str.lines() {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse::<usize>().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(end) = header_end {
+                if raw.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+        if raw.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&raw).into_owned())
+        }
+    }
+
     fn spawn_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
     where
-        F: Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+        F: Fn(&str, &str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
         let addr = listener.local_addr().expect("local addr");
@@ -1031,13 +1087,9 @@ mod tests {
         let handle = thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                if n == 0 {
+                let Some(req_str) = read_http_request(&mut stream) else {
                     continue;
-                }
-                let req_str = String::from_utf8_lossy(&buf[..n]);
+                };
                 let target = req_str
                     .lines()
                     .next()
@@ -1047,7 +1099,7 @@ mod tests {
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                     break;
                 }
-                let (status, ctype, body) = handler(target);
+                let (status, ctype, body) = handler(target, &req_str);
                 let header = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1087,13 +1139,24 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for AppState condition");
+        panic!(
+            "timed out waiting for AppState condition (notice={:?}, chat_len={}, decision_len={}, vv_online={})",
+            state.status_notice,
+            state.chat_history.len(),
+            state.decision_log.len(),
+            state.voicevox_online
+        );
     }
 
     #[test]
     fn app_state_runs_voicevox_check_decision_and_chat_with_mock_server() {
+        use std::sync::{Arc, Mutex};
+
         let wav = silent_wav_bytes();
-        let (base_url, server_thread) = spawn_mock_http_server(move |target| {
+        let chat_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chat_requests_srv = Arc::clone(&chat_requests);
+
+        let (base_url, server_thread) = spawn_mock_http_server(move |target, raw_req| {
             if target == "/version" {
                 (200, "application/json", br#""0.15.0""#.to_vec())
             } else if target == "/speakers" {
@@ -1111,6 +1174,10 @@ mod tests {
                 let dec = r#"{"candidates":[{"content":{"parts":[{"text":"{\"action\":\"SIT_ON_WINDOW\",\"target_expression\":\"Smile\",\"reason\":\"focusing\"}"}]}}]}"#;
                 (200, "application/json", dec.as_bytes().to_vec())
             } else {
+                chat_requests_srv
+                    .lock()
+                    .expect("lock chat_requests")
+                    .push(raw_req.to_owned());
                 let chat = r#"{"candidates":[{"content":{"parts":[{"text":"{\"reply_text\":\"こんにちは！\",\"emotion\":\"happy\"}"}]}}]}"#;
                 (200, "application/json", chat.as_bytes().to_vec())
             }
@@ -1153,13 +1220,31 @@ mod tests {
         );
 
         // Chat triggers Dialogue LLM -> VOICEVOX synthesis -> SpeechPlayer lip-sync
-        state.send_chat("おはよう".to_owned());
+        state.send_chat("first_turn_marker".to_owned());
         wait_until(&mut state, |s| {
             !s.chat_in_flight && s.chat_history.len() == 2
         });
         assert_eq!(state.chat_history[1].content, "こんにちは！");
         assert_eq!(state.current_mood, EmotionTag::Happy);
         assert!(state.speech_player.is_playing());
+
+        // Clear chat history synchronously clears UI log and dispatches ClearChatHistory to worker
+        state.clear_chat_history();
+        assert!(state.chat_history.is_empty());
+        state.send_chat("second_turn_marker".to_owned());
+        wait_until(&mut state, |s| {
+            !s.chat_in_flight && s.chat_history.len() == 2
+        });
+        {
+            let reqs = chat_requests.lock().expect("lock chat_requests");
+            assert_eq!(reqs.len(), 2);
+            assert!(reqs[0].contains("first_turn_marker"));
+            assert!(
+                !reqs[1].contains("first_turn_marker"),
+                "worker DialogueClient history should have been cleared before second chat turn"
+            );
+            assert!(reqs[1].contains("second_turn_marker"));
+        }
 
         // ChangeExpression decision event updates current_mood without LLM/TTS
         state.apply_event(AppEvent::DecisionResult {
@@ -1197,7 +1282,7 @@ mod tests {
     #[test]
     fn app_state_speak_decision_triggers_dialogue_and_voicevox_lipsync() {
         let wav = silent_wav_bytes();
-        let (base_url, server_thread) = spawn_mock_http_server(move |target| {
+        let (base_url, server_thread) = spawn_mock_http_server(move |target, _| {
             if target == "/version" {
                 (200, "application/json", br#""0.15.0""#.to_vec())
             } else if target == "/speakers" {

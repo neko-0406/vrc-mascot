@@ -3,14 +3,14 @@
 Windows 向けの透過最前面 3D デスクトップマスコットアプリケーションです。
 Unity エディタを起動することなく VRChat 向け Unity プロジェクトからアバター（メッシュ・ボーン・BlendShape・PhysBone・VRCExpressionsMenu/FX・シェーダーパラメータ）を抽出し、`wgpu` + Win32 API による軽量な常駐表示、AI 自律行動・対話、VOICEVOX 音声合成・リップシンク連携を行います。
 
-## クレート構成
+## クレート構成（6クレート・ワークスペース）
 
-- `crates/vrc-schema`: 中間データ (`mascot_manifest.json`)・設定 (`config.toml`)・共通ランタイム型定義
-- `crates/vrc-extractor`: Unity プロジェクト外部解析エンジン & CLI (`avatar.glb` + `mascot_manifest.json` 出力)
-- `crates/vrc-physics`: `VRCPhysBone` / `Collider` 互換 Verlet/PBD 物理演算
-- `crates/vrc-renderer`: `wgpu` + WGSL トゥーンシェーダーレンダラー (lilToon / Poiyomi / UTS / Fur / AudioLink)
-- `crates/vrc-ai`: Gemini Decisions API / 対話 LLM / VOICEVOX Engine クライアント & リップシンク
-- `crates/vrc-mascot-app`: Windows 常駐デスクトップアプリ本体 (`winit` 2ウィンドウ + `egui` UI + Win32 制御 + トレイ常駐)
+- `crates/vrc-schema`: 中間データ (`mascot_manifest.json`)・設定 (`config.toml`)・アバターレジストリ (`AvatarRegistry`)・共通ランタイム型定義
+- `crates/vrc-extractor`: Unity プロジェクト外部解析エンジン & CLI（YAML/Prefab Variant 解決、Modular Avatar 仮想適用、`ufbx` 読込、`avatar.glb` + `mascot_manifest.json` 出力）
+- `crates/vrc-physics`: スケルトン FK、`VRCPhysBone` / `Collider` 互換 Verlet/PBD 物理演算、自律モーション・撫で判定、FX ステートマシン
+- `crates/vrc-renderer`: `wgpu` + WGSL 4パス・トゥーンレンダラー（lilToon / Poiyomi / UTS / Outline / Fur / WASAPI AudioLink / オフスクリーンヒットテスト）
+- `crates/vrc-ai`: Gemini Decisions API / 対話 LLM / プライバシーフィルタ / VOICEVOX Engine クライアント / `rodio` 同期リップシンク再生
+- `crates/vrc-mascot-app`: Windows 常駐デスクトップアプリ本体（単一 `winit` 2ウィンドウ構成、`egui` 4タブ UI、Win32 透過・クリック透過・ウィンドウ着席追従、システムトレイ常駐）
 
 ## 前提環境
 
@@ -23,29 +23,42 @@ Unity エディタを起動することなく VRChat 向け Unity プロジェ�
 ## ビルド・テスト・実行
 
 ```powershell
-# ワークスペース全体のビルド
+# ワークスペース全体のビルド（開発用 / リリース）
 cargo build --workspace
+cargo build --workspace --release
 
-# テスト実行
+# テスト・フォーマット・Clippy チェック
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Clippy チェック
-cargo clippy --workspace --all-targets
-
-# Unity プロジェクトからアバター抽出
+# Unity プロジェクトからアバター抽出 CLI
+# vrc-extractor --project <DIR> --scene <SCENE> --avatar <NAME> --output <DIR> [--no-modular-avatar] [--max-texture-size <PX>]
 cargo run -p vrc-extractor -- `
   --project "C:\Path\To\UnityProject" `
   --scene "Assets/SampleScene.unity" `
   --avatar "SampleAvatar" `
-  --output ".\out\SampleAvatar"
+  --output ".\out\SampleAvatar" `
+  --max-texture-size 2048
 
-# デスクトップマスコット起動
+# デスクトップマスコット起動 CLI
+# vrc-mascot-app [--manifest <PATH>] [--show-window]
 cargo run -p vrc-mascot-app -- --manifest ".\out\SampleAvatar\mascot_manifest.json"
+
+# ステータス・設定ウィンドウを最初から開いて起動（登録アバターまたは内蔵フォールバックモデルを使用）
+cargo run -p vrc-mascot-app -- --show-window
 ```
+
+## 主な操作方法
+
+- **移動・重力・着席**: アバター本体の不透明部分を左ドラッグで移動（離すとタスクバーまたは他ウィンドウ上辺へ落下・着席）
+- **PhysBone 直接掴み**: `Shift` + 左ドラッグで髪や耳などの PhysBone を直接引っ張る
+- **拡大・縮小**: アバター上でマウスホイール上下（`0.5x〜2.0x`）
+- **メニュー・設定画面**: アバター右クリック、またはタスクトレイアイコンのメニュー／クリックから「ステータス・設定ウィンドウ」開閉・アバター切替・Expressions 操作・終了が可能（ステータスウィンドウは閉じてもトレイ常駐を継続します）
 
 ## 設定と環境変数
 
-- 実行時設定は `%APPDATA%/vrc-mascot/config.toml` に保存されます。
+- 実行時設定は `%APPDATA%/vrc-mascot/config.toml` に保存されます（設定タブから全 6 セクション編集・保存可能）。
 - 開発時のフォールバックとして `.env.example` を `.env` にコピーして使用できます（`.env` は `.gitignore` 対象であり、リポジトリへコミットしないでください）。
 
 ## Git-Flow 運用
