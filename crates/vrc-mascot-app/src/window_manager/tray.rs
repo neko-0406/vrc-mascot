@@ -161,6 +161,9 @@ fn append_expression_items(
     Ok(())
 }
 
+const TRAY_ICON_ID: &str = "vrc-desktop-mascot-tray";
+const TRAY_ICON_GUID: u128 = 0x7A4B_9D12_4E3F_4B89_A1C0_3F5E_21D8_0942;
+
 /// Manages the live Windows system tray icon and avatar right-click context menu.
 pub struct TrayController {
     tray_icon: TrayIcon,
@@ -176,10 +179,14 @@ impl TrayController {
         let context_menu_model = TrayMenuModel::build(spec)?;
 
         let tray_icon = TrayIconBuilder::new()
+            .with_id(TRAY_ICON_ID)
+            .with_guid(TRAY_ICON_GUID)
             .with_tooltip("VRC Desktop Mascot")
             .with_icon(icon)
             .with_menu(Box::new(tray_menu_model.menu.clone()))
             .build()?;
+
+        tracing::info!(tray_id = TRAY_ICON_ID, "System tray icon initialized");
 
         Ok(Self {
             tray_icon,

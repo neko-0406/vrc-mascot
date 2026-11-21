@@ -5,7 +5,9 @@ use std::ffi::c_void;
 use std::path::Path;
 
 use windows::core::{BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, ERROR_FILE_NOT_FOUND, HWND, LPARAM, POINT, RECT,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -23,11 +25,11 @@ use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
-    SystemParametersInfoW, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN,
-    SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetLayeredWindowAttributes,
+    SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW, GWL_EXSTYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, LWA_ALPHA, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WS_EX_APPWINDOW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -127,7 +129,8 @@ fn to_hwnd(raw: isize) -> HWND {
 }
 
 /// Applies initial desktop mascot Win32 extended styles (`WS_EX_LAYERED | WS_EX_TOOLWINDOW`,
-/// optional `WS_EX_TOPMOST` and `WS_EX_TRANSPARENT`).
+/// optional `WS_EX_TOPMOST` and `WS_EX_TRANSPARENT`) and initializes layered opacity to 255
+/// (`LWA_ALPHA`) so DWM does not treat the window as 0-alpha invisible.
 pub fn configure_avatar_window(hwnd_raw: isize, always_on_top: bool, click_through: bool) {
     if hwnd_raw == 0 {
         return;
@@ -145,6 +148,9 @@ pub fn configure_avatar_window(hwnd_raw: isize, always_on_top: bool, click_throu
         if next != current {
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
         }
+        // Without SetLayeredWindowAttributes (or UpdateLayeredWindow), WS_EX_LAYERED leaves
+        // bAlpha=0 / dwFlags=0, making the window 100% invisible and halting WM_PAINT delivery.
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         let insert_after = if always_on_top {
             HWND_TOPMOST
         } else {
@@ -170,13 +176,18 @@ pub fn set_click_through(hwnd_raw: isize, transparent: bool) {
     let hwnd = to_hwnd(hwnd_raw);
     unsafe {
         let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let next = if transparent {
-            current | (WS_EX_TRANSPARENT.0 as isize)
+        let had_layered = (current & (WS_EX_LAYERED.0 as isize)) != 0;
+        let mut next = current | (WS_EX_LAYERED.0 as isize);
+        if transparent {
+            next |= WS_EX_TRANSPARENT.0 as isize;
         } else {
-            current & !(WS_EX_TRANSPARENT.0 as isize)
-        };
+            next &= !(WS_EX_TRANSPARENT.0 as isize);
+        }
         if next != current {
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+            if !had_layered {
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            }
         }
     }
 }
@@ -565,4 +576,101 @@ fn is_shell_class(class_name: &str) -> bool {
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetLayeredWindowAttributes, WINDOW_EX_STYLE, WS_OVERLAPPED,
+    };
+
+    struct TestHwnd(HWND);
+
+    impl TestHwnd {
+        fn new_hidden() -> Self {
+            let class = to_wide_null("STATIC");
+            let title = to_wide_null("vrc_mascot_win32_test");
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(class.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    16,
+                    16,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("create hidden test HWND");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestHwnd {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn configure_avatar_window_initializes_layered_alpha_and_toolwindow() {
+        let win = TestHwnd::new_hidden();
+        let raw = win.0 .0 as isize;
+        configure_avatar_window(raw, true, false);
+
+        let ex = unsafe { GetWindowLongPtrW(win.0, GWL_EXSTYLE) };
+        assert_ne!(ex & (WS_EX_LAYERED.0 as isize), 0);
+        assert_ne!(ex & (WS_EX_TOOLWINDOW.0 as isize), 0);
+        assert_ne!(ex & (WS_EX_TOPMOST.0 as isize), 0);
+        assert_eq!(ex & (WS_EX_APPWINDOW.0 as isize), 0);
+        assert_eq!(ex & (WS_EX_TRANSPARENT.0 as isize), 0);
+
+        let mut cr_key = COLORREF(0);
+        let mut alpha = 0u8;
+        let mut flags = Default::default();
+        unsafe {
+            GetLayeredWindowAttributes(
+                win.0,
+                Some(&mut cr_key),
+                Some(&mut alpha),
+                Some(&mut flags),
+            )
+            .expect("GetLayeredWindowAttributes must succeed");
+        }
+        assert_eq!(alpha, 255);
+        assert_eq!(flags, LWA_ALPHA);
+    }
+
+    #[test]
+    fn set_click_through_toggles_transparent_and_initializes_layered_alpha() {
+        let win = TestHwnd::new_hidden();
+        let raw = win.0 .0 as isize;
+
+        set_click_through(raw, true);
+        let ex_on = unsafe { GetWindowLongPtrW(win.0, GWL_EXSTYLE) };
+        assert_ne!(ex_on & (WS_EX_LAYERED.0 as isize), 0);
+        assert_ne!(ex_on & (WS_EX_TRANSPARENT.0 as isize), 0);
+
+        let mut alpha = 0u8;
+        let mut flags = Default::default();
+        unsafe {
+            GetLayeredWindowAttributes(win.0, None, Some(&mut alpha), Some(&mut flags))
+                .expect("GetLayeredWindowAttributes must succeed");
+        }
+        assert_eq!(alpha, 255);
+        assert_eq!(flags, LWA_ALPHA);
+
+        set_click_through(raw, false);
+        let ex_off = unsafe { GetWindowLongPtrW(win.0, GWL_EXSTYLE) };
+        assert_eq!(ex_off & (WS_EX_TRANSPARENT.0 as isize), 0);
+        assert_ne!(ex_off & (WS_EX_LAYERED.0 as isize), 0);
+    }
 }

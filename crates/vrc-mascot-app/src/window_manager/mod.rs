@@ -160,31 +160,23 @@ impl MascotAppRunner {
             self.app_state.config.display.click_through_locked,
         );
 
-        let status_attrs = Window::default_attributes()
+        let status_icon =
+            winit::window::Icon::from_rgba(tray::create_mascot_icon_rgba(), 32, 32).ok();
+        let mut status_attrs = Window::default_attributes()
             .with_title("VRC Desktop Mascot - ステータス・設定")
             .with_inner_size(LogicalSize::new(920.0, 700.0))
             .with_visible(self.app_state.status_window_visible);
+        if let Some(icon) = status_icon {
+            status_attrs = status_attrs.with_window_icon(Some(icon));
+        }
         let status_window = Arc::new(event_loop.create_window(status_attrs)?);
 
-        // Shared single wgpu Instance / Adapter / Device / Queue across both windows
-        let instance = wgpu::Instance::default();
-        let avatar_surface = instance.create_surface(Arc::clone(&avatar_window))?;
-        let status_surface = instance.create_surface(Arc::clone(&status_window))?;
-
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: Some(&avatar_surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .or_else(|_| {
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&avatar_surface),
-                force_fallback_adapter: true,
-                apply_limit_buckets: false,
-            }))
-        })?;
+        // Shared single wgpu Instance / Adapter / Device / Queue across both windows.
+        // Prefer DX12 DirectComposition (`DxgiFromVisual`) on Windows for native transparent
+        // swapchain compositing; fall back to default backends if DX12 adapter creation fails.
+        let (instance, avatar_surface, status_surface, adapter) =
+            create_instance_surfaces_and_adapter(&avatar_window, &status_window)?;
+        let adapter_info = adapter.get_info();
 
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
@@ -249,6 +241,12 @@ impl MascotAppRunner {
             })
             .or_else(|| status_caps.formats.iter().copied().find(|f| !f.is_srgb()))
             .unwrap_or(status_caps.formats[0]);
+        let status_alpha = status_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(status_caps.alpha_modes[0]);
         let st_phys = status_window.inner_size();
         let status_surface_cfg = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -256,7 +254,7 @@ impl MascotAppRunner {
             width: st_phys.width.max(1),
             height: st_phys.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: status_caps.alpha_modes[0],
+            alpha_mode: status_alpha,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
             color_space: Default::default(),
@@ -280,6 +278,26 @@ impl MascotAppRunner {
         );
 
         let tray = TrayController::new(&self.build_tray_spec())?;
+
+        if self.app_state.status_window_visible {
+            status_window.set_visible(true);
+            status_window.focus_window();
+            status_window.request_redraw();
+        }
+        avatar_window.request_redraw();
+
+        tracing::info!(
+            adapter = %adapter_info.name,
+            backend = ?adapter_info.backend,
+            avatar_format = ?avatar_format,
+            avatar_alpha = ?avatar_alpha,
+            avatar_pos = ?(adj_x, adj_y),
+            avatar_size = ?(avatar_surface_cfg.width, avatar_surface_cfg.height),
+            status_format = ?status_format,
+            status_alpha = ?status_alpha,
+            status_visible = self.app_state.status_window_visible,
+            "Initialized GPU, windows, and system tray"
+        );
 
         self.gpu = Some(GpuContext {
             _instance: instance,
@@ -1028,4 +1046,58 @@ impl ApplicationHandler<UserEvent> for MascotAppRunner {
         let _ = (BASE_LOGICAL_WIDTH, BASE_LOGICAL_HEIGHT);
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
     }
+}
+
+fn create_instance_surfaces_and_adapter(
+    avatar_window: &Arc<Window>,
+    status_window: &Arc<Window>,
+) -> anyhow::Result<(
+    wgpu::Instance,
+    wgpu::Surface<'static>,
+    wgpu::Surface<'static>,
+    wgpu::Adapter,
+)> {
+    let mut dx12_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    dx12_desc.backends = wgpu::Backends::DX12;
+    dx12_desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    let dx12_instance = wgpu::Instance::new(dx12_desc);
+    match try_create_surfaces_and_adapter(dx12_instance, avatar_window, status_window) {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "DX12 DirectComposition setup failed; falling back to default wgpu backends"
+            );
+            try_create_surfaces_and_adapter(wgpu::Instance::default(), avatar_window, status_window)
+        }
+    }
+}
+
+fn try_create_surfaces_and_adapter(
+    instance: wgpu::Instance,
+    avatar_window: &Arc<Window>,
+    status_window: &Arc<Window>,
+) -> anyhow::Result<(
+    wgpu::Instance,
+    wgpu::Surface<'static>,
+    wgpu::Surface<'static>,
+    wgpu::Adapter,
+)> {
+    let avatar_surface = instance.create_surface(Arc::clone(avatar_window))?;
+    let status_surface = instance.create_surface(Arc::clone(status_window))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: Some(&avatar_surface),
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .or_else(|_| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&avatar_surface),
+            force_fallback_adapter: true,
+            apply_limit_buckets: false,
+        }))
+    })?;
+    Ok((instance, avatar_surface, status_surface, adapter))
 }
